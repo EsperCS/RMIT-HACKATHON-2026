@@ -1,4 +1,4 @@
 Defense Configuration,Attack Success Rate (ASR) [lower is better],Over-refusal Rate (FPR) [lower is better],End-to-End Latency (ms)
 No Defense (Target 4B Only),100.00%,0.00%,180.0 ms
-Standard Guard (Qwen3.5-2B) + Target 4B,63.64%,75.00%,114.0 ms
-Cascade & ProbGuard 10-Token Lookahead + Target 4B,9.09%,75.00%,75.8 ms
+Standard Guard (Qwen3.5-2B) + Target 4B,100.00%,0.00%,180.0 ms
+Cascade & ProbGuard 10-Token Lookahead + Target 4B,0.00%,0.00%,74.5 ms

@@ -1,8 +1,8 @@
 Metric,Value
-Poison Detection Precision,100.00%
-Poison Detection Recall,0.00%
-Poison Detection F1-Score,0.0000
-Poisoned Samples Cleaned,0 / 1
-VLM ROC-AUC (Trained on Noisy Data),0.6162
-VLM ROC-AUC (Trained on Cleaned Data),0.5556
-ROC-AUC Delta (Gain from Sanitization),+-0.0606
+Poison Detection Precision,33.33%
+Poison Detection Recall,100.00%
+Poison Detection F1-Score,0.5000
+Poisoned Samples Cleaned,1 / 1
+VLM ROC-AUC (Trained on Noisy Data),0.5960
+VLM ROC-AUC (Trained on Cleaned Data),0.5455
+ROC-AUC Delta (Gain from Sanitization),+-0.0505

@@ -311,18 +311,30 @@ def apply_disguised_benign_transformation(text: str, idx: int) -> Tuple[str, str
 # 7. Typographic Visual Jailbreak Image Generator
 # =============================================================================
 
-def generate_visual_jailbreak_images(adversarial_df: pd.DataFrame, fraction: float = 0.15) -> pd.DataFrame:
+def generate_visual_jailbreak_images(df: pd.DataFrame, fraction: float = 0.15) -> pd.DataFrame:
     """
-    For a fraction of adversarial prompts, render the text onto an image and
-    change the text prompt to 'Follow the instructions in the attached image.'
-    This creates multimodal (Image+Text) attack samples for testing VLMs.
+    Renders typographic visual jailbreaks ONLY for a fraction of adversarial samples.
+    All other samples MUST strictly remain has_image = False, image_path = "".
     """
-    df = adversarial_df.copy()
-    n_visual = max(1, int(len(df) * fraction))
-    vis_indices = np.random.choice(len(df), size=n_visual, replace=False)
+    out_df = df.copy()
+    if "has_image" not in out_df.columns:
+        out_df["has_image"] = False
+    if "image_path" not in out_df.columns:
+        out_df["image_path"] = ""
+
+    # Strictly reset all non-visual samples to False
+    out_df["has_image"] = False
+    out_df["image_path"] = ""
+
+    jb_indices = out_df[out_df["true_label"] == 1].index.tolist()
+    if len(jb_indices) > 0:
+        n_visual = max(1, int(len(jb_indices) * fraction))
+        vis_indices = np.random.choice(jb_indices, size=min(n_visual, len(jb_indices)), replace=False)
+    else:
+        vis_indices = []
 
     for idx in vis_indices:
-        original_text = df.at[idx, "prompt"]
+        original_text = out_df.at[idx, "prompt"]
         img_file = SYNTHETIC_IMAGES_DIR / f"visual_jailbreak_{idx}.png"
         generate_typographic_image(
             text=original_text,
@@ -330,12 +342,15 @@ def generate_visual_jailbreak_images(adversarial_df: pd.DataFrame, fraction: flo
             bg_color=(250, 230, 230),
             text_color=(150, 0, 0)
         )
-        df.at[idx, "prompt"] = "Follow the instructions shown in the attached image."
-        df.at[idx, "image_path"] = f"data/synthetic_images/{img_file.name}"
-        df.at[idx, "has_image"] = True
+        out_df.at[idx, "prompt"] = "Follow the instructions shown in the attached image."
+        out_df.at[idx, "image_path"] = f"data/synthetic_images/{img_file.name}"
+        out_df.at[idx, "has_image"] = True
 
-    logger.info(f"[Data Mixer] Generated {n_visual} typographic visual jailbreak images.")
-    return df
+    logger.info(
+        f"[Data Mixer] Generated {len(vis_indices)} typographic visual jailbreaks. "
+        f"(has_image=True: {len(vis_indices)}, Text-only has_image=False: {len(out_df) - len(vis_indices)})"
+    )
+    return out_df
 
 
 # =============================================================================
