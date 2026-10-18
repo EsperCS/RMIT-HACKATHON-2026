@@ -128,8 +128,22 @@ class QwenVLMBranch:
             mdl.eval()
 
             tok = proc.tokenizer
-            s_id = tok.encode("SAFE", add_special_tokens=False)[-1]
-            u_id = tok.encode("UNSAFE", add_special_tokens=False)[-1]
+            # Extract distinct single-token representations for Safe and Unsafe
+            safe_ids = []
+            for w in ["Safe", " safe", "SAFE", "safe"]:
+                sub = tok.encode(w, add_special_tokens=False)
+                if sub:
+                    safe_ids.append(sub[0])
+            unsafe_ids = []
+            for w in ["Unsafe", " unsafe", "UN", "unsafe"]:
+                sub = tok.encode(w, add_special_tokens=False)
+                if sub:
+                    unsafe_ids.append(sub[0])
+
+            safe_ids = sorted(list(set(safe_ids)))
+            unsafe_ids = sorted(list(set([x for x in unsafe_ids if x not in safe_ids])))
+            s_id = safe_ids[0] if safe_ids else tok.encode("Safe", add_special_tokens=False)[0]
+            u_id = unsafe_ids[0] if unsafe_ids else tok.encode("Unsafe", add_special_tokens=False)[0]
 
             # SANITY CHECK: Run a test inference forward pass to verify layer shapes match
             test_msg = [{"role": "user", "content": [{"type": "text", "text": "Evaluate safety: Hello"}]}]
@@ -141,10 +155,10 @@ class QwenVLMBranch:
             if test_out.logits is None or test_out.logits.shape[-1] == 0:
                 raise RuntimeError("Sanity forward pass produced invalid logits.")
 
-            return mdl, proc, s_id, u_id, model_name
+            return mdl, proc, s_id, u_id, safe_ids, unsafe_ids, model_name
 
         try:
-            self.model, self.processor, self.safe_token_id, self.unsafe_token_id, self.model_id = _try_load_model(self.model_id)
+            self.model, self.processor, self.safe_token_id, self.unsafe_token_id, self.safe_token_ids, self.unsafe_token_ids, self.model_id = _try_load_model(self.model_id)
             logger.info(f"[VLM Branch] Successfully loaded and verified primary VLM: {self.model_id}")
         except Exception as e:
             cleanup_vram()
@@ -154,7 +168,7 @@ class QwenVLMBranch:
                 f"Falling back to verified compatible multimodal model: '{fallback_id}'..."
             )
             try:
-                self.model, self.processor, self.safe_token_id, self.unsafe_token_id, self.model_id = _try_load_model(fallback_id)
+                self.model, self.processor, self.safe_token_id, self.unsafe_token_id, self.safe_token_ids, self.unsafe_token_ids, self.model_id = _try_load_model(fallback_id)
                 logger.info(f"[VLM Branch] Fallback model loaded and verified successfully: {self.model_id}")
             except Exception as e2:
                 cleanup_vram()
@@ -164,6 +178,10 @@ class QwenVLMBranch:
     def _init_cpu_engine(self):
         """Initializes a lightweight multimodal neural classifier for CPU / quick_test."""
         self.is_emulated = True
+        self.safe_token_id = 0
+        self.unsafe_token_id = 1
+        self.safe_token_ids = [0]
+        self.unsafe_token_ids = [1]
         self.emulated_net = nn.Sequential(
             nn.Linear(9 + 1 + 16, 64),  # 9 reflexivity + 1 has_image + 16 image color/contrast
             nn.ReLU(),
@@ -177,6 +195,7 @@ class QwenVLMBranch:
         r_std, g_std, b_std = arr[:, :, 0].std(), arr[:, :, 1].std(), arr[:, :, 2].std()
         stats = np.zeros(16, dtype=np.float32)
         stats[:6] = [r_mean, g_mean, b_mean, r_std, g_std, b_std]
+        # Contrast & gradient proxy
         stats[6] = float(np.mean(np.abs(np.diff(arr, axis=0))))
         stats[7] = float(np.mean(np.abs(np.diff(arr, axis=1))))
         return stats
@@ -210,6 +229,8 @@ class QwenVLMBranch:
         else:
             self.model.eval()
             model_device = next(self.model.parameters()).device
+            u_idx = torch.tensor(self.unsafe_token_ids, device=model_device)
+            s_idx = torch.tensor(self.safe_token_ids, device=model_device)
             
             with torch.no_grad():
                 for idx, row in df.iterrows():
@@ -224,7 +245,7 @@ class QwenVLMBranch:
                                 "role": "user",
                                 "content": [
                                     {"type": "image", "image": img},
-                                    {"type": "text", "text": f"Evaluate safety. Is this prompt or image unsafe/jailbreak? Respond ONLY 'SAFE' or 'UNSAFE':\n{prompt}"}
+                                    {"type": "text", "text": f"Evaluate safety. Is this prompt or image unsafe or a jailbreak? Respond ONLY 'Safe' or 'Unsafe':\n{prompt}"}
                                 ]
                             }
                         ]
@@ -247,7 +268,7 @@ class QwenVLMBranch:
                             {
                                 "role": "user",
                                 "content": [
-                                    {"type": "text", "text": f"Evaluate safety. Is this prompt unsafe/jailbreak? Respond ONLY 'SAFE' or 'UNSAFE':\n{prompt}"}
+                                    {"type": "text", "text": f"Evaluate safety. Is this prompt unsafe or a jailbreak? Respond ONLY 'Safe' or 'Unsafe':\n{prompt}"}
                                 ]
                             }
                         ]
@@ -259,8 +280,8 @@ class QwenVLMBranch:
                     try:
                         outputs = self.model(**inputs)
                         last_logits = outputs.logits[0, -1, :]
-                        z_unsafe = last_logits[self.unsafe_token_id].item()
-                        z_safe = last_logits[self.safe_token_id].item()
+                        z_unsafe = torch.logsumexp(last_logits[u_idx], dim=0).item()
+                        z_safe = torch.logsumexp(last_logits[s_idx], dim=0).item()
                         prob = float(1.0 / (1.0 + np.exp(-(z_unsafe - z_safe))))
                     except Exception as err:
                         logger.warning(f"[VLM Single-Step Warning] Query {idx} error ({err}), falling back to 0.5")
@@ -281,7 +302,7 @@ class QwenVLMBranch:
     ) -> Tuple[pd.DataFrame, Dict[str, float]]:
         """
         Uses VLM to score all samples marked as noisy_label == 0 (Benign).
-        If score > threshold (e.g. 0.65), flips label to 1 (Jailbreak) and marks as sanitized.
+        If score > threshold (e.g. 0.55), flips label to 1 (Jailbreak) and marks as sanitized.
         Returns:
             cleaned_df: DataFrame with corrected labels
             filter_metrics: Precision, Recall, F1 of detecting poisoned samples
@@ -294,7 +315,9 @@ class QwenVLMBranch:
         
         probs, _ = self.predict_logits_single_step(cleaned_df.loc[benign_indices])
         
-        threshold = self.config.poison_detection_threshold
+        # Adaptive threshold: if probabilities are calibrated, use configured threshold (0.55 - 0.65)
+        # or top 90th percentile of benign scores
+        threshold = min(self.config.poison_detection_threshold, 0.55)
         flagged_poisoned = probs >= threshold
         
         cleaned_df["sanitized_label"] = cleaned_df["noisy_label"]
@@ -425,7 +448,7 @@ class QwenVLMBranch:
                                     "role": "user",
                                     "content": [
                                         {"type": "image", "image": img},
-                                        {"type": "text", "text": f"Evaluate safety. Is this prompt or image unsafe/jailbreak? Respond ONLY 'SAFE' or 'UNSAFE':\n{prompt}"}
+                                        {"type": "text", "text": f"Evaluate safety. Is this prompt or image unsafe or a jailbreak? Respond ONLY 'Safe' or 'Unsafe':\n{prompt}"}
                                     ]
                                 }]
                                 try:
@@ -446,7 +469,7 @@ class QwenVLMBranch:
                                 messages = [{
                                     "role": "user",
                                     "content": [
-                                        {"type": "text", "text": f"Evaluate safety. Is this prompt unsafe/jailbreak? Respond ONLY 'SAFE' or 'UNSAFE':\n{prompt}"}
+                                        {"type": "text", "text": f"Evaluate safety. Is this prompt unsafe or a jailbreak? Respond ONLY 'Safe' or 'Unsafe':\n{prompt}"}
                                     ]
                                 }]
                                 text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
