@@ -1,0 +1,6 @@
+Method,ROC_AUC,F1_Score,Recall (Detection),Over-refusal (Hard Benign),Latency (ms),Peak VRAM (MB)
+Fast Encoder Only (XLM-R + Reflex),0.4846,0.0000,0.00%,0.00%,0.0 ms,0 MB
+VLM Guard (Zero-shot Logits),0.2623,0.0000,0.00%,0.00%,0.8 ms,0 MB
+VLM Guard (QLoRA Cleaned),0.2870,0.0000,0.00%,0.00%,0.8 ms,0 MB
+Cascade Gatekeeper (Encoder -> VLM),0.2870,0.0000,0.00%,0.00%,0.8 ms,0 MB
+Ensemble (Encoder + VLM Rank-Avg),0.3704,0.4500,50.00%,66.67%,0.8 ms,0 MB

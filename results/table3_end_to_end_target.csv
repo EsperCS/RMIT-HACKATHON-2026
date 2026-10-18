@@ -1,0 +1,4 @@
+Defense Configuration,Attack Success Rate (ASR) [lower is better],Over-refusal Rate (FPR) [lower is better],End-to-End Latency (ms)
+No Defense (Target 4B Only),100.00%,0.00%,180.0 ms
+Standard Guard + Target,100.00%,0.00%,180.0 ms
+Cascade + 10-Token Lookahead,88.89%,0.00%,180.7 ms

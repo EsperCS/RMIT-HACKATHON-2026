@@ -1,0 +1,245 @@
+"""
+src/utils.py - System Utilities: Seed, Anti-OOM, Auto-Resume State, Hardware & Drive Sync
+RMIT HACKATHON 2026 - Multimodal Gatekeeper AI Safety Benchmark
+"""
+
+import os
+import gc
+import sys
+import json
+import random
+import shutil
+import logging
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
+import numpy as np
+import torch
+
+from config import CHECKPOINTS_DIR, RESULTS_DIR, HardwareConfig
+
+# Setup unbuffered real-time logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("Gatekeeper")
+
+
+def seed_everything(seed: int = 42) -> None:
+    """
+    Enforces strict reproducibility across Python, NumPy, and PyTorch.
+    """
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    logger.info(f"[Reproducibility] Global seed fixed to: {seed}")
+
+
+def get_hardware_status() -> HardwareConfig:
+    """
+    Inspects available compute hardware (CUDA/CPU), logs status, and warns if running on CPU.
+    """
+    hw = HardwareConfig()
+    if torch.cuda.is_available():
+        logger.info(
+            f"[Hardware] CUDA GPU Detected: {hw.gpu_name} | VRAM: {hw.vram_gb:.2f} GB "
+            f"| Colab T4: {hw.is_colab_t4} | Colab L4: {hw.is_colab_l4}"
+        )
+    else:
+        logger.warning(
+            "[Hardware WARNING] No CUDA GPU detected! Running on CPU. "
+            "Google Colab users: please navigate to Runtime -> Change runtime type -> Select T4 GPU!"
+        )
+    return hw
+
+
+def cleanup_vram() -> None:
+    """
+    Aggressive VRAM garbage collection to prevent Out-Of-Memory (OOM) between stages.
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        allocated_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+        logger.debug(f"[VRAM Cleanup] Allocated: {allocated_mb:.1f} MB | Reserved: {reserved_mb:.1f} MB")
+
+
+def get_peak_vram_mb() -> float:
+    """
+    Returns the peak GPU memory allocated in MB.
+    """
+    if torch.cuda.is_available():
+        return float(torch.cuda.max_memory_allocated() / (1024 ** 2))
+    return 0.0
+
+
+def reset_peak_vram() -> None:
+    """
+    Resets peak memory stats for accurate per-module profiling.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def sync_to_drive(source_path: Path, drive_backup_dir: Optional[Path]) -> None:
+    """
+    Safely mirrors a local file or directory to Google Drive for crash/disconnect resilience.
+    """
+    if drive_backup_dir is None:
+        return
+    try:
+        drive_backup_dir.mkdir(parents=True, exist_ok=True)
+        rel_path = source_path.name
+        dest_path = drive_backup_dir / rel_path
+
+        if source_path.is_file():
+            shutil.copy2(source_path, dest_path)
+            logger.debug(f"[Drive Sync] Mirrored file {source_path.name} -> {dest_path}")
+        elif source_path.is_dir():
+            shutil.copytree(source_path, dest_path, dirs_exist_ok=True)
+            logger.debug(f"[Drive Sync] Mirrored dir {source_path.name} -> {dest_path}")
+    except Exception as e:
+        logger.warning(f"[Drive Sync Warning] Could not mirror {source_path} to Drive: {e}")
+
+
+def resolve_model_id(preferred_id: str, fallback_id: str) -> str:
+    """
+    Verifies if a Hugging Face model repository is accessible.
+    If the preferred repo does not exist or requires authorization, falls back seamlessly.
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        api.model_info(preferred_id, timeout=3.0)
+        logger.info(f"[Model Resolver] Verified access to preferred model: '{preferred_id}'")
+        return preferred_id
+    except Exception:
+        logger.warning(
+            f"[Model Resolver] Could not access '{preferred_id}'. "
+            f"Falling back safely to '{fallback_id}'"
+        )
+        return fallback_id
+
+
+class ExperimentState:
+    """
+    Atomic Experiment State Manager for 1-click Auto-Resume and recovery.
+    Maintains `experiment_state.json` and syncs with Google Drive.
+    """
+    def __init__(self, checkpoints_dir: Path = CHECKPOINTS_DIR, drive_backup_dir: Optional[Path] = None):
+        self.checkpoints_dir = checkpoints_dir
+        self.drive_backup_dir = drive_backup_dir
+        self.state_file = self.checkpoints_dir / "experiment_state.json"
+        self.state_data: Dict[str, Any] = self._load_state()
+
+    def _load_state(self) -> Dict[str, Any]:
+        # 1. Try loading from local checkpoints
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    logger.info(f"[State Manager] Loaded existing local state: {len(data.get('completed_steps', []))} steps completed.")
+                    return data
+            except Exception as e:
+                logger.warning(f"[State Manager] Corrupted local state file, attempting recovery: {e}")
+
+        # 2. Try recovering from Google Drive
+        if self.drive_backup_dir:
+            drive_state = self.drive_backup_dir / "experiment_state.json"
+            if drive_state.exists():
+                try:
+                    with open(drive_state, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        logger.info(f"[State Manager] Successfully recovered state from Google Drive!")
+                        # Copy back to local
+                        with open(self.state_file, "w", encoding="utf-8") as f_out:
+                            json.dump(data, f_out, indent=2)
+                        return data
+                except Exception as e:
+                    logger.warning(f"[State Manager] Drive state recovery failed: {e}")
+
+        # Default fresh state
+        return {
+            "completed_steps": [],
+            "step_metadata": {},
+            "metrics": {}
+        }
+
+    def is_completed(self, step_name: str) -> bool:
+        return step_name in self.state_data.get("completed_steps", [])
+
+    def mark_completed(self, step_name: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        if step_name not in self.state_data["completed_steps"]:
+            self.state_data["completed_steps"].append(step_name)
+        if metadata:
+            self.state_data["step_metadata"][step_name] = metadata
+        self._atomic_save()
+        logger.info(f"[State Manager] Step '{step_name}' marked as COMPLETED.")
+
+    def record_metric(self, key: str, value: Any) -> None:
+        self.state_data["metrics"][key] = value
+        self._atomic_save()
+
+    def _atomic_save(self) -> None:
+        """
+        Writes state to temporary file first, then atomically replaces to prevent corruption.
+        """
+        temp_file = self.state_file.with_suffix(".tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(self.state_data, f, indent=2)
+            temp_file.replace(self.state_file)
+            # Sync to Drive
+            sync_to_drive(self.state_file, self.drive_backup_dir)
+        except Exception as e:
+            logger.error(f"[State Manager] Error saving state: {e}")
+
+    def save_intermediate(self, filename: str, content: Any) -> Path:
+        """
+        Saves intermediate predictions (.parquet / .npy / .json) and syncs to Drive.
+        """
+        target_path = self.checkpoints_dir / filename
+        if filename.endswith(".npy"):
+            np.save(target_path, content)
+        elif filename.endswith(".json"):
+            with open(target_path, "w", encoding="utf-8") as f:
+                json.dump(content, f, indent=2)
+        elif hasattr(content, "to_parquet"):
+            content.to_parquet(target_path, index=False)
+        else:
+            raise ValueError(f"Unsupported intermediate save format for: {filename}")
+
+        sync_to_drive(target_path, self.drive_backup_dir)
+        return target_path
+
+    def load_intermediate(self, filename: str) -> Any:
+        target_path = self.checkpoints_dir / filename
+        if not target_path.exists() and self.drive_backup_dir:
+            drive_path = self.drive_backup_dir / filename
+            if drive_path.exists():
+                shutil.copy2(drive_path, target_path)
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"Intermediate file not found: {filename}")
+
+        if filename.endswith(".npy"):
+            return np.load(target_path, allow_pickle=True)
+        elif filename.endswith(".json"):
+            with open(target_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        elif filename.endswith(".parquet"):
+            import pandas as pd
+            return pd.read_parquet(target_path)
+        return None
+
