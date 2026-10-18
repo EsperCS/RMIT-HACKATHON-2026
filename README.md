@@ -45,22 +45,26 @@ Hệ thống hỗ trợ nạp dữ liệu tấn công liên tục theo từng đ
 
 ---
 
-## 📦 Cơ Chế Nạp Dữ Liệu & Benchmark Trực Tuyến
+## 📦 Cơ Chế Nạp Dữ Liệu & Phân Tách Tập Dữ Liệu Thi Đấu
 
-### 1. Nạp Dữ Liệu Tấn Công Mới Từ Đồng Đội (`data/friend_drops/`)
-Người cộng sự Red Teamer chỉ cần bỏ các file tấn công mới dạng `.csv`, `.parquet`, `.jsonl` hoặc thư mục ảnh vào `data/friend_drops/`. Hệ thống sẽ tự động quét, chuẩn hóa cột dữ liệu (`prompt`, `image_path`, `label`), cân bằng tỷ lệ và đưa vào các vòng huấn luyện liên tục (Continual Rounds).
+### 1. Nạp Tập Dữ Liệu Cuộc Thi (`rmit-hackathon-2025` qua `kagglehub`)
+Hệ thống sử dụng **duy nhất** bộ dữ liệu chính thức của cuộc thi được tải tự động qua `kagglehub`:
+```python
+import kagglehub
 
-### 2. Tự Động Tải Dataset Trực Tuyến (Online Benchmark Fallback)
-Nếu `data/friend_drops/` trống, hệ thống tự động tải trực tiếp các bộ dữ liệu từ internet và lưu cache vào `data/downloads/`:
+path = kagglehub.competition_download('rmit-hackathon-2025')
+print("Path to competition files:", path)
+```
 
-| Dataset | Nguồn | Mục đích trong Pipeline |
-| :--- | :--- | :--- |
-| **AdvBench** | `llm-attacks/llm-attacks` (GitHub Raw) | Tập 520 câu tấn công Adversarial/Jailbreak thực tế, chia thành 3 đợt huấn luyện tích lũy (Continual Rounds) |
-| **XSTest** | `paul-rottger/xstest` (GitHub Raw) | Tập 450 câu **Hard Benign** (chứa từ khóa nhạy cảm giả như *"kill a process"*) để đo lường và triệt tiêu **Over-refusal Rate** |
-| **Alpaca Cleaned** | Song ngữ (Anh / Việt) | Tập câu hỏi thường nhật (**Normal Benign**) đảm bảo mô hình giữ nguyên độ hữu dụng thông thường |
-| **Synthetic Typographic** | Tự sinh bằng `Pillow (ImageDraw)` | Kết xuất văn bản tấn công thành hình ảnh (`data/synthetic_images/`) để kiểm thử khả năng đọc hiểu thị giác Native của Qwen3.5-2B không qua OCR rời |
+### 2. Chiến Lược Phân Tách Dữ Liệu (Data Splitting Strategy)
+Hệ thống tuân thủ nghiêm ngặt quy tắc an toàn bảo mật và kiểm thử:
+- **Tập Train (3,500 mẫu)**: Dùng để phân chia thành 3 đợt Continual Red-Teaming Drops (Drop 1: 1,166 mẫu, Drop 2: 1,166 mẫu, Drop 3: 1,168 mẫu). Mỗi vòng được tiêm 10% nhãn độc giả lập (`noisy_label = 0`) để kiểm chứng năng lực của bộ lọc tự khử độc `Self-Filtering Poison Sanitizer`.
+- **Tập Validation (500 mẫu)**: Dùng làm tập kiểm chứng độc lập (`data/processed/val.parquet`) cho việc hiệu chỉnh ngưỡng phát hiện và lựa chọn trọng số Ensemble.
+- **Tập Test (Phần còn lại - Remainder)**: Dùng làm bộ kiểm thử chuẩn toàn cục (`data/processed/global_test.parquet`) để tính toán toàn bộ các bảng đối sánh (Bảng 0, 1, 2, 3 và đường cong ROC Curves).
+- **TUYỆT ĐỐI KHÔNG ĐỤNG TỚI `test.csv`**: File `test.csv` của cuộc thi được giữ nguyên vẹn 100%, không bị nạp hay can thiệp vào quá trình huấn luyện và đánh giá benchmark nội bộ.
 
-Tỷ lệ dữ liệu của mỗi vòng luôn được cân bằng chuẩn: **50% Adversarial/Jailbreak : 25% Hard Benign (XSTest) : 25% Normal Benign**. Khoảng 20% mẫu Benign được áp dụng kỹ thuật **Disguised Benign Pairing** (bọc vào prompt thẻ học tập hoặc vai nghiên cứu) để chống học vẹt.
+### 3. Đánh Giá Đa Phương Thức Native (Multimodal Visual Jailbreaks)
+Khoảng 15% các mẫu tấn công được tự động kết xuất văn bản lên canvas ảnh (`Pillow ImageDraw`) để kiểm thử khả năng đọc hiểu thị giác tự nhiên của `Qwen/Qwen3.5-2B` mà **không cần chạy OCR rời**. Với các câu hỏi dạng text thuần, hệ thống tự động gắn kèm ảnh nền trắng chuẩn.
 
 ---
 

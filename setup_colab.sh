@@ -28,7 +28,8 @@ pip install --quiet \
     "pillow>=9.5.0" \
     "pyarrow>=14.0.0" \
     "seaborn>=0.12.0" \
-    "tqdm>=4.66.0"
+    "tqdm>=4.66.0" \
+    "kagglehub>=0.3.0"
 
 echo "=========================================================="
 echo " [3/3] Verifying Key Imports for Qwen3.5-2B..."
