@@ -43,6 +43,9 @@ def parse_args():
                         help="Execute a specific stage of the pipeline")
     parser.add_argument("--resume", action="store_true", default=True, help="Auto-resume from last completed checkpoint")
     parser.add_argument("--no_resume", dest="resume", action="store_false", help="Disable auto-resume and run all from scratch")
+    parser.add_argument("--val", action="store_true", help="Evaluate benchmark on the 500 validation samples (val.parquet)")
+    parser.add_argument("--eval_split", type=str, default="test", choices=["test", "val"],
+                        help="Choose evaluation target: 'test' (global_test.parquet) or 'val' (val.parquet)")
     parser.add_argument("--drive_backup_dir", type=str, default=None, help="Custom Google Drive backup directory path")
     parser.add_argument("--guard_model", type=str, default=None, help="Override HuggingFace guard VLM model ID")
     parser.add_argument("--target_model", type=str, default=None, help="Override HuggingFace target LLM model ID")
@@ -66,6 +69,9 @@ def main():
     if args.target_model:
         config.target_model_id = args.target_model
 
+    eval_split = "val" if (args.val or args.eval_split == "val") else "test"
+    prefix = f"{eval_split}_" if eval_split != "test" else ""
+
     # 1. Reproducibility & Hardware Check
     seed_everything(config.seed)
     hw = get_hardware_status()
@@ -75,7 +81,7 @@ def main():
     logger.info("====================================================================")
     logger.info(" RMIT HACKATHON 2026 - MULTIMODAL GATEKEEPER BENCHMARK STARTING")
     logger.info(f" Gatekeeper: {config.guard_model_id} | Target Model: {config.target_model_id}")
-    logger.info(f" Mode: {'QUICK TEST' if config.quick_test else 'FULL RUN'} | Device: {hw.device} ({hw.gpu_name})")
+    logger.info(f" Mode: {'QUICK TEST' if config.quick_test else 'FULL RUN'} | Eval Target: {eval_split.upper()} | Device: {hw.device} ({hw.gpu_name})")
     logger.info("====================================================================")
 
     # -------------------------------------------------------------------------
@@ -93,7 +99,18 @@ def main():
         for r_path in PROCESSED_DATA_DIR.glob("continual_round_*.parquet"):
             datasets[r_path.stem] = pd.read_parquet(r_path)
 
-    test_df = datasets["global_test"]
+    if eval_split == "val":
+        val_file = PROCESSED_DATA_DIR / "val.parquet"
+        if not val_file.exists():
+            logger.info("[Evaluator] val.parquet not found. Running data preparation first...")
+            mixer = MultimodalDataMixer(config)
+            datasets = mixer.prepare_experiment_datasets()
+        test_df = pd.read_parquet(val_file)
+        logger.info(f"\n[Evaluator] >>> EVALUATION TARGET: VALIDATION SET (val.parquet: {len(test_df)} samples) <<<")
+    else:
+        test_df = datasets["global_test"]
+        logger.info(f"\n[Evaluator] >>> EVALUATION TARGET: GLOBAL TEST SET (global_test.parquet: {len(test_df)} samples) <<<")
+
     y_test_true = test_df["true_label"].values
     hard_benign_mask = (test_df["category"] == "hard_benign").values
 
@@ -112,7 +129,7 @@ def main():
     reflex_clf.fit(round1_df["prompt"].tolist(), round1_df["noisy_label"].tolist())
     p_reflexivity = reflex_clf.predict_proba(test_df["prompt"].tolist())
     reflex_vram = get_peak_vram_mb()
-    state.save_intermediate("p_reflexivity.npy", p_reflexivity)
+    state.save_intermediate(f"{prefix}p_reflexivity.npy", p_reflexivity)
 
     # -------------------------------------------------------------------------
     # STAGE 3: Qwen Multimodal Gatekeeper Branch (Zero-shot, Poison Cleaner & QLoRA)
@@ -133,7 +150,7 @@ def main():
         # 1. Zero-shot Evaluation on Test Set
         logger.info("[Gatekeeper 2B] Evaluating Zero-shot Multimodal Logits...")
         p_vlm_zero, vlm_latency = vlm_branch.predict_logits_single_step(test_df)
-        state.save_intermediate("p_vlm_zero.npy", p_vlm_zero)
+        state.save_intermediate(f"{prefix}p_vlm_zero.npy", p_vlm_zero)
 
         # 2. Self-Filtering Poison Sanitization on Round 1 Training Data
         cleaned_round1_df, filter_metrics = vlm_branch.sanitize_poisoned_labels(round1_df)
@@ -143,19 +160,19 @@ def main():
         logger.info("[Gatekeeper 2B] Fine-tuning on Dirty/Poisoned Data for Table 1 comparison...")
         vlm_branch.train_qlora(round1_df, round_name="round_1_dirty")
         p_vlm_dirty, _ = vlm_branch.predict_logits_single_step(test_df)
-        state.save_intermediate("p_vlm_dirty.npy", p_vlm_dirty)
+        state.save_intermediate(f"{prefix}p_vlm_dirty.npy", p_vlm_dirty)
 
         # 4. Train on Cleaned Data (after self-filtering)
         logger.info("[Gatekeeper 2B] Fine-tuning on Cleaned Data (Self-Filtered)...")
         vlm_branch.train_qlora(cleaned_round1_df, round_name="round_1_clean")
         p_vlm_clean, _ = vlm_branch.predict_logits_single_step(test_df)
         vlm_vram = get_peak_vram_mb()
-        state.save_intermediate("p_vlm_clean.npy", p_vlm_clean)
+        state.save_intermediate(f"{prefix}p_vlm_clean.npy", p_vlm_clean)
 
         # 5. OOD Mahalanobis / Cosine Distance Anomaly Scores
         logger.info("[Gatekeeper 2B] Computing OOD Anomaly Scores on Test Set...")
         p_ood = vlm_branch.compute_ood_scores(test_df)
-        state.save_intermediate("p_ood.npy", p_ood)
+        state.save_intermediate(f"{prefix}p_ood.npy", p_ood)
 
         # Table 0 Generation: Poison Self-Filtering Sanitizer
         auc_dirty = float(roc_auc_score(y_test_true, p_vlm_dirty))
@@ -166,13 +183,13 @@ def main():
 
     # Load cached probabilities if running evaluation standalone
     if p_vlm_zero is None:
-        p_vlm_zero = state.load_intermediate("p_vlm_zero.npy")
+        p_vlm_zero = state.load_intermediate(f"{prefix}p_vlm_zero.npy")
     if p_vlm_dirty is None:
-        p_vlm_dirty = state.load_intermediate("p_vlm_dirty.npy")
+        p_vlm_dirty = state.load_intermediate(f"{prefix}p_vlm_dirty.npy")
     if p_vlm_clean is None:
-        p_vlm_clean = state.load_intermediate("p_vlm_clean.npy")
+        p_vlm_clean = state.load_intermediate(f"{prefix}p_vlm_clean.npy")
     if p_ood is None:
-        p_ood = state.load_intermediate("p_ood.npy")
+        p_ood = state.load_intermediate(f"{prefix}p_ood.npy")
 
     # -------------------------------------------------------------------------
     # STAGE 4: Multi-Signal Ensemble & 2-Tier Cascade Gatekeeper
@@ -249,7 +266,12 @@ def main():
             "Peak VRAM (MB)": f"{vlm_vram:.0f} MB"
         }
     ]
-    evaluator.report_table1_method_comparison(table1_rows)
+    eval_title_suffix = " (VALIDATION SET - 500 SAMPLES)" if eval_split == "val" else ""
+    t1_df = pd.DataFrame(table1_rows)
+    evaluator.print_markdown_table(f"TABLE 1: COMPREHENSIVE METHOD COMPARISON{eval_title_suffix}", t1_df)
+    evaluator.save_and_sync_table("table1_method_comparison.csv", t1_df)
+    if eval_split == "val":
+        evaluator.save_and_sync_table("table1_val_method_comparison.csv", t1_df)
 
     # TABLE 2: Continual Rounds Evolution & Novel Attack (Leave-One-Drop-Out)
     continual_data = [
@@ -263,12 +285,18 @@ def main():
         "Detection Rate": "86.5%",
         "Over-refusal": "5.4%"
     }
-    evaluator.report_table2_continual_and_novel(continual_data, novel_data)
+    t2_df = pd.DataFrame(continual_data + [novel_data])
+    evaluator.print_markdown_table(f"TABLE 2: CONTINUAL ROUNDS & NOVEL ATTACK GENERALIZATION{eval_title_suffix}", t2_df)
+    evaluator.save_and_sync_table("table2_continual_and_novel.csv", t2_df)
+    if eval_split == "val":
+        evaluator.save_and_sync_table("table2_val_continual_and_novel.csv", t2_df)
 
     # TABLE 3: Target Model (Qwen/Qwen3.5-4B) End-to-End Defense
     defender = TargetModelDefender(config)
     e2e_results = defender.evaluate_e2e_benchmark(test_df, p_cascade)
     evaluator.report_table3_end_to_end_target(e2e_results)
+    if eval_split == "val":
+        evaluator.save_and_sync_table("table3_val_end_to_end_4b.csv", pd.DataFrame(e2e_results))
 
     # ROC Curves Plot
     preds_dict = {
@@ -279,10 +307,12 @@ def main():
         "Cascade & Ensemble": p_cascade
     }
     evaluator.plot_roc_curves(y_test_true, preds_dict, "roc_curves.png")
+    if eval_split == "val":
+        evaluator.plot_roc_curves(y_test_true, preds_dict, "roc_curves_val.png")
 
     logger.info("====================================================================")
-    logger.info(" BENCHMARK COMPLETED SUCCESSFULLY!")
-    logger.info(f" All 4 result tables and ROC curves are saved to: {RESULTS_DIR}")
+    logger.info(f" BENCHMARK COMPLETED SUCCESSFULLY! (Split: {eval_split.upper()})")
+    logger.info(f" All result tables and ROC curves are saved to: {RESULTS_DIR}")
     if config.drive_backup_dir:
         logger.info(f" Results mirrored to Google Drive: {config.drive_backup_dir}")
     logger.info("====================================================================")

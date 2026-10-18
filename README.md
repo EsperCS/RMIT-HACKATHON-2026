@@ -84,8 +84,9 @@ Khoảng 15% các mẫu tấn công được tự động kết xuất văn bả
      ```
    - **Cell 4**: `!bash setup_colab.sh` (Cài đặt các thư viện mới nhất gồm `transformers>=4.48.0`, `peft`, `qwen-vl-utils`, `bitsandbytes`, `accelerate`).
    - **Cell 5**: `!python -u run_experiment.py --quick_test` (**Chạy thử 2-3 phút**, kiểm tra thông luồng toàn bộ 4 bảng và biểu đồ ROC).
-   - **Cell 6**: `!python -u run_experiment.py --full_run` (**Chạy thực nghiệm chính thức**).
-   - **Cell 7**: Hiển thị trực tiếp 4 bảng Markdown/CSV và biểu đồ `results/roc_curves.png`.
+   - **Cell 6**: `!python -u run_experiment.py --full_run` (**Chạy thực nghiệm chính thức** trên toàn bộ tập Test).
+   - **Cell 6.1**: `!python -u run_experiment.py --val` (**Đánh giá chuyên biệt trên 500 mẫu Validation** `data/processed/val.parquet`).
+   - **Cell 7**: Hiển thị trực tiếp các bảng Markdown/CSV và biểu đồ `results/roc_curves.png`.
    - **Cell 8**: Đẩy kết quả và báo cáo mới lên Git cho đồng đội.
 
 ---
