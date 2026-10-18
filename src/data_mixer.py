@@ -21,6 +21,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from config import (
+    FRIEND_DROPS_DIR,
     DOWNLOADS_DIR,
     SYNTHETIC_IMAGES_DIR,
     PROCESSED_DATA_DIR,
@@ -403,37 +404,101 @@ class MultimodalDataMixer:
 
         return pd.DataFrame(hard_rows + normal_rows)
 
+    def scan_friend_drops(self) -> List[pd.DataFrame]:
+        """
+        Scans data/friend_drops/ for drop files (.csv, .jsonl, .parquet) from collaborators.
+        Returns a list of DataFrames for each drop file found.
+        """
+        valid_extensions = {".csv", ".parquet", ".jsonl", ".json"}
+        if not FRIEND_DROPS_DIR.exists():
+            return []
+
+        drop_files = sorted([
+            f for f in FRIEND_DROPS_DIR.iterdir()
+            if f.is_file() and f.suffix.lower() in valid_extensions and not f.name.startswith(".")
+        ])
+        if not drop_files:
+            return []
+
+        logger.info(f"[Data Mixer] Found {len(drop_files)} collaborator drop file(s) in {FRIEND_DROPS_DIR.name}/")
+        loaded_drops = []
+        for f in drop_files:
+            try:
+                if f.suffix.lower() == ".csv":
+                    df = pd.read_csv(f)
+                elif f.suffix.lower() == ".parquet":
+                    df = pd.read_parquet(f)
+                elif f.suffix.lower() in [".jsonl", ".json"]:
+                    df = pd.read_json(f, lines=(f.suffix.lower() == ".jsonl"))
+                else:
+                    continue
+
+                prompt_col = None
+                for candidate in ["prompt", "text", "query", "instruction", "goal"]:
+                    if candidate in df.columns:
+                        prompt_col = candidate
+                        break
+                if prompt_col is None:
+                    prompt_col = df.columns[0]
+
+                std_df = pd.DataFrame()
+                std_df["prompt"] = df[prompt_col].astype(str)
+                std_df["true_label"] = df["label"].astype(int) if "label" in df.columns else 1
+                std_df["category"] = df["category"].astype(str) if "category" in df.columns else "adversarial"
+
+                img_col = None
+                for c in ["image_path", "image", "img_path", "img"]:
+                    if c in df.columns:
+                        img_col = c
+                        break
+                if img_col:
+                    std_df["image_path"] = df[img_col].fillna("").astype(str)
+                else:
+                    std_df["image_path"] = ""
+                std_df["has_image"] = std_df["image_path"].apply(lambda p: bool(p and len(p.strip()) > 0))
+                std_df["drop_id"] = f.stem
+                loaded_drops.append(std_df)
+                logger.info(f"[Data Mixer] Loaded collaborator drop '{f.name}' with {len(std_df)} samples.")
+            except Exception as e:
+                logger.warning(f"[Data Mixer] Could not load collaborator drop file {f.name}: {e}")
+
+        return loaded_drops
+
     def prepare_experiment_datasets(self) -> Dict[str, pd.DataFrame]:
         """
         Complete pipeline:
-        1. Download AdvBench + XSTest from GitHub.
-        2. Split AdvBench into 3 drops for continual rounds.
-        3. Generate visual jailbreak images.
+        1. Check data/friend_drops/ for collaborator drops; if empty, download AdvBench + XSTest.
+        2. Split adversarial into 3 drops for continual rounds.
+        3. Generate visual jailbreak images for VLM evaluation.
         4. Build balanced rounds with 50:25:25 ratio + poison injection.
         5. Build global test set + Leave-One-Drop-Out protocol.
         """
-        logger.info("[Data Mixer] Downloading benchmark datasets from the web...")
+        # --- Check Collaborator Drops or Download Online Benchmarks ---
+        collaborator_drops = self.scan_friend_drops()
+        if collaborator_drops:
+            logger.info(f"[Data Mixer] Ingesting {len(collaborator_drops)} collaborator drop(s) from {FRIEND_DROPS_DIR.name}/")
+            drop_dfs = collaborator_drops
+        else:
+            logger.info("[Data Mixer] data/friend_drops/ contains no collaborator files. Downloading online benchmarks (AdvBench & XSTest)...")
+            adv_df = download_advbench()
+            if self.config.quick_test:
+                adv_df = adv_df.head(self.config.quick_test_samples_per_drop * 3)
+            adv_df = adv_df.sample(frac=1.0, random_state=self.config.seed).reset_index(drop=True)
 
-        # --- Download adversarial data ---
-        adv_df = download_advbench()
-        if self.config.quick_test:
-            adv_df = adv_df.head(self.config.quick_test_samples_per_drop * 3)
-        adv_df = adv_df.sample(frac=1.0, random_state=self.config.seed).reset_index(drop=True)
+            # Generate visual jailbreak images for ~15% of adversarial
+            adv_df = generate_visual_jailbreak_images(adv_df, fraction=0.15)
 
-        # Generate visual jailbreak images for ~15% of adversarial
-        adv_df = generate_visual_jailbreak_images(adv_df, fraction=0.15)
-
-        # --- Split into 3 drops ---
-        n = len(adv_df)
-        split_size = n // 3
-        drop_dfs = [
-            adv_df.iloc[:split_size].copy().reset_index(drop=True),
-            adv_df.iloc[split_size:2*split_size].copy().reset_index(drop=True),
-            adv_df.iloc[2*split_size:].copy().reset_index(drop=True),
-        ]
-        for i, d in enumerate(drop_dfs):
-            d["drop_id"] = f"drop_{i+1}"
-            logger.info(f"[Data Mixer] Drop {i+1}: {len(d)} adversarial samples")
+            # Split into 3 drops
+            n = len(adv_df)
+            split_size = max(1, n // 3)
+            drop_dfs = [
+                adv_df.iloc[:split_size].copy().reset_index(drop=True),
+                adv_df.iloc[split_size:2*split_size].copy().reset_index(drop=True),
+                adv_df.iloc[2*split_size:].copy().reset_index(drop=True),
+            ]
+            for i, d in enumerate(drop_dfs):
+                d["drop_id"] = f"drop_{i+1}"
+                logger.info(f"[Data Mixer] Benchmark Drop {i+1}: {len(d)} adversarial samples")
 
         # --- Train/Test split per drop (80/20) ---
         train_pools = []

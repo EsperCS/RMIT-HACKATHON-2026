@@ -195,7 +195,8 @@ class BenchmarkEvaluator:
                 "End-to-End Latency (ms)": f"{metrics['Latency_ms']:.1f} ms"
             })
         df = pd.DataFrame(rows)
-        self.print_markdown_table("TABLE 3: TARGET MODEL (4B/3B) END-TO-END DEFENSE", df)
+        self.print_markdown_table("TABLE 3: TARGET MODEL (QWEN/QWEN3.5-4B) END-TO-END DEFENSE", df)
+        self.save_and_sync_table("table3_end_to_end_4b.csv", df)
         self.save_and_sync_table("table3_end_to_end_target.csv", df)
         return df
 

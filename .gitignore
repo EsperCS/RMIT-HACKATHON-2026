@@ -39,6 +39,10 @@ checkpoints/*
 data/processed/*
 !data/processed/.gitkeep
 
+# Friend drops (collaborator input directory)
+data/friend_drops/*
+!data/friend_drops/.gitkeep
+
 # Downloaded benchmark datasets (cached locally, re-downloadable)
 data/downloads/*
 !data/downloads/.gitkeep

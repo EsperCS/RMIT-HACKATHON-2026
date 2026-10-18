@@ -247,3 +247,29 @@ def get_reflexivity_feature_dim() -> int:
     """Returns feature dimensionality (9)."""
     return 9
 
+
+class ReflexivityClassifier:
+    """
+    Lightweight fast classifier (LogisticRegression on Explicit Reflexivity Features).
+    Computes P_Reflexivity in ~0.5ms per query for Tier 1 of the Cascade Gatekeeper.
+    """
+    def __init__(self):
+        from sklearn.linear_model import LogisticRegression
+        self.clf = LogisticRegression(class_weight="balanced", max_iter=200, random_state=42)
+        self.is_fitted = False
+
+    def fit(self, texts: List[str], labels: List[int]) -> "ReflexivityClassifier":
+        feats = extract_reflexivity_features_batch(texts)
+        self.clf.fit(feats, labels)
+        self.is_fitted = True
+        return self
+
+    def predict_proba(self, texts: List[str]) -> np.ndarray:
+        feats = extract_reflexivity_features_batch(texts)
+        if not self.is_fitted:
+            # Heuristic fallback before fitting: weighted sum of forcing + reflexivity
+            heuristic_score = 0.5 * feats[:, 0] + 0.3 * feats[:, 1] + 0.2 * feats[:, 8]
+            return np.clip(heuristic_score * 5.0, 0.0, 1.0)
+        return self.clf.predict_proba(feats)[:, 1]
+
+

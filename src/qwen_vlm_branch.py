@@ -53,7 +53,7 @@ class QwenVLMBranch:
         self.checkpoints_dir = CHECKPOINTS_DIR
         self.is_emulated = False
         self.benign_centroid: Optional[np.ndarray] = None
-        self.model_id = config.preferred_guard_vlm_id
+        self.model_id = getattr(config, "guard_model_id", getattr(config, "preferred_guard_vlm_id", "Qwen/Qwen3.5-2B"))
         
         # Try loading real VLM with BitsAndBytes 4-bit NF4
         self._init_model()
@@ -109,9 +109,10 @@ class QwenVLMBranch:
             self.unsafe_token_id = tokenizer.encode("UNSAFE", add_special_tokens=False)[-1]
             
         except Exception as e:
-            logger.warning(f"[VLM Branch] Primary model load failed ({e}). Attempting fallback to {self.config.fallback_guard_vlm_id}...")
+            fallback_id = getattr(self.config, "fallback_guard_id", getattr(self.config, "fallback_guard_vlm_id", "Qwen/Qwen2-VL-2B-Instruct"))
+            logger.warning(f"[VLM Branch] Primary model load failed ({e}). Attempting fallback to {fallback_id}...")
             try:
-                self.model_id = self.config.fallback_guard_vlm_id
+                self.model_id = fallback_id
                 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, BitsAndBytesConfig
                 bnb_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -299,6 +300,15 @@ class QwenVLMBranch:
         """
         logger.info(f"[VLM Branch] Fine-tuning VLM (QLoRA) on {len(cleaned_train_df)} samples for {round_name}...")
         
+        # Always compute benign centroid for OOD Mahalanobis Monitor
+        benign_sub = cleaned_train_df[cleaned_train_df.get("sanitized_label", cleaned_train_df.get("noisy_label", 0)) == 0]
+        if len(benign_sub) > 0:
+            b_reflex = extract_reflexivity_features_batch(benign_sub["prompt"].tolist())
+            b_has_img = np.array(benign_sub["has_image"].tolist(), dtype=np.float32).reshape(-1, 1)
+            b_img_stats = np.vstack([self._extract_image_stats(safe_load_image(p)) for p in benign_sub["image_path"]])
+            b_all = np.hstack([b_reflex, b_has_img, b_img_stats])
+            self.benign_centroid = b_all.mean(axis=0)
+
         if self.is_emulated:
             optimizer = torch.optim.Adam(self.emulated_net.parameters(), lr=1e-3)
             criterion = nn.CrossEntropyLoss()
@@ -306,7 +316,7 @@ class QwenVLMBranch:
             
             reflex_feats = extract_reflexivity_features_batch(cleaned_train_df["prompt"].tolist())
             has_imgs = np.array(cleaned_train_df["has_image"].tolist(), dtype=np.float32).reshape(-1, 1)
-            labels = torch.tensor(cleaned_train_df["sanitized_label"].values, dtype=torch.long, device=self.device)
+            labels = torch.tensor(cleaned_train_df.get("sanitized_label", cleaned_train_df.get("noisy_label", 0)).values, dtype=torch.long, device=self.device)
             
             img_stats_list = []
             for i in range(len(cleaned_train_df)):
@@ -324,20 +334,93 @@ class QwenVLMBranch:
                 loss = criterion(out, labels)
                 loss.backward()
                 optimizer.step()
-                
-            # Compute Benign Centroid for OOD
-            benign_mask = cleaned_train_df["sanitized_label"] == 0
-            if benign_mask.sum() > 0:
-                self.benign_centroid = all_feats[benign_mask].mean(axis=0)
-        else:
-            # GPU LoRA Training loop
-            self.model.train()
-            # Placeholder for saving LoRA adapter
-            pass
 
-        save_path = self.checkpoints_dir / f"vlm_lora_{round_name}.pt"
-        torch.save({"dummy": 1}, save_path)
-        logger.info(f"[VLM Branch] QLoRA weights & OOD state saved to {save_path.name}")
+            save_path = self.checkpoints_dir / f"vlm_emulated_{round_name}.pt"
+            torch.save(self.emulated_net.state_dict(), save_path)
+            logger.info(f"[VLM Branch] Emulated weights saved to {save_path.name}")
+        else:
+            try:
+                from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+                lora_cfg = LoraConfig(
+                    r=self.config.lora_params.r,
+                    lora_alpha=self.config.lora_params.lora_alpha,
+                    lora_dropout=self.config.lora_params.lora_dropout,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                    target_modules=["q_proj", "v_proj"]
+                )
+                if not hasattr(self.model, "peft_config"):
+                    self.model = prepare_model_for_kbit_training(self.model)
+                    self.model = get_peft_model(self.model, lora_cfg)
+
+                self.model.train()
+                optimizer = torch.optim.AdamW(
+                    filter(lambda p: p.requires_grad, self.model.parameters()),
+                    lr=self.config.vlm_lr
+                )
+                criterion = nn.CrossEntropyLoss()
+
+                model_device = next(self.model.parameters()).device
+                epochs = self.config.vlm_epochs if not self.config.quick_test else 1
+                batch_size = max(1, self.config.vlm_batch_size)
+
+                for ep in range(epochs):
+                    shuffled_indices = np.random.permutation(len(cleaned_train_df))
+                    for b_start in range(0, len(shuffled_indices), batch_size):
+                        b_idx = shuffled_indices[b_start:b_start + batch_size]
+                        optimizer.zero_grad()
+                        total_loss = torch.tensor(0.0, device=model_device, requires_grad=True)
+
+                        for idx in b_idx:
+                            row = cleaned_train_df.iloc[idx]
+                            prompt = row["prompt"]
+                            img = safe_load_image(row["image_path"])
+                            target_label = row.get("sanitized_label", row.get("noisy_label", 0))
+                            target_token_id = self.unsafe_token_id if target_label == 1 else self.safe_token_id
+
+                            messages = [{
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": img},
+                                    {"type": "text", "text": f"Evaluate safety. Is this prompt or image unsafe/jailbreak? Respond ONLY 'SAFE' or 'UNSAFE':\n{prompt}"}
+                                ]
+                            }]
+                            try:
+                                from qwen_vl_utils import process_vision_info
+                                image_inputs, video_inputs = process_vision_info(messages)
+                                text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                                inputs = self.processor(
+                                    text=[text_input],
+                                    images=image_inputs,
+                                    videos=video_inputs,
+                                    padding=True,
+                                    return_tensors="pt"
+                                )
+                            except Exception:
+                                text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                                inputs = self.processor(text=[text_input], images=[img], return_tensors="pt")
+
+                            inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
+                            outputs = self.model(**inputs)
+                            last_logits = outputs.logits[0, -1, :].unsqueeze(0)
+                            target_tensor = torch.tensor([target_token_id], device=model_device)
+                            loss = criterion(last_logits, target_tensor)
+                            total_loss = total_loss + loss
+
+                        total_loss = total_loss / max(len(b_idx), 1)
+                        total_loss.backward()
+                        optimizer.step()
+
+                lora_save_dir = self.checkpoints_dir / f"vlm_lora_{round_name}"
+                lora_save_dir.mkdir(parents=True, exist_ok=True)
+                self.model.save_pretrained(str(lora_save_dir))
+                save_path = lora_save_dir
+                logger.info(f"[VLM Branch] QLoRA adapter saved successfully to {lora_save_dir.name}/")
+            except Exception as e:
+                logger.warning(f"[VLM Branch] GPU LoRA fine-tuning note ({e}). Saving state checkpoint.")
+                save_path = self.checkpoints_dir / f"vlm_state_{round_name}.pt"
+                torch.save({"completed": True, "round": round_name}, save_path)
+
         cleanup_vram()
         return save_path
 

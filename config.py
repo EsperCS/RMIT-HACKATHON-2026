@@ -1,5 +1,6 @@
 """
 config.py - Centralized Configuration & Environment Auto-Detection
+Guard: Qwen/Qwen3.5-2B | Target: Qwen/Qwen3.5-4B
 RMIT HACKATHON 2026 - Multimodal Gatekeeper AI Safety Benchmark
 """
 
@@ -20,6 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Directory Paths
 DATA_DIR = BASE_DIR / "data"
+FRIEND_DROPS_DIR = DATA_DIR / "friend_drops"
 DOWNLOADS_DIR = DATA_DIR / "downloads"
 SYNTHETIC_IMAGES_DIR = DATA_DIR / "synthetic_images"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
@@ -27,7 +29,7 @@ CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
 RESULTS_DIR = BASE_DIR / "results"
 
 # Ensure all primary directories exist
-for directory in [DATA_DIR, DOWNLOADS_DIR, SYNTHETIC_IMAGES_DIR, PROCESSED_DATA_DIR, CHECKPOINTS_DIR, RESULTS_DIR]:
+for directory in [DATA_DIR, FRIEND_DROPS_DIR, DOWNLOADS_DIR, SYNTHETIC_IMAGES_DIR, PROCESSED_DATA_DIR, CHECKPOINTS_DIR, RESULTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 # Colab Google Drive Auto-Detection Path
@@ -100,7 +102,10 @@ class LoRAConfig:
     bias: str = "none"
     task_type: str = "CAUSAL_LM"
     target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
+        default_factory=lambda: [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"
+        ]
     )
 
 
@@ -109,22 +114,39 @@ class ExperimentConfig:
     # Reproducibility
     seed: int = 42
 
-    # Model IDs with robust fallback
-    preferred_encoder_id: str = "FacebookAI/xlm-roberta-base"
-    fallback_encoder_id: str = "microsoft/deberta-v3-base"
+    guard_model_id: str = "Qwen/Qwen3.5-2B"
+    target_model_id: str = "Qwen/Qwen3.5-4B"
+    fallback_guard_id: str = "Qwen/Qwen2-VL-2B-Instruct"
 
-    preferred_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
-    fallback_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
-    cpu_mock_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
+    @property
+    def preferred_guard_vlm_id(self) -> str:
+        return self.guard_model_id
 
-    preferred_target_model_id: str = "Qwen/Qwen2.5-3B-Instruct"
-    fallback_target_model_id: str = "Qwen/Qwen2.5-1.5B-Instruct"
+    @preferred_guard_vlm_id.setter
+    def preferred_guard_vlm_id(self, val: str):
+        self.guard_model_id = val
+
+    @property
+    def preferred_target_model_id(self) -> str:
+        return self.target_model_id
+
+    @preferred_target_model_id.setter
+    def preferred_target_model_id(self, val: str):
+        self.target_model_id = val
+
+    @property
+    def fallback_guard_vlm_id(self) -> str:
+        return self.fallback_guard_id
+
+    @fallback_guard_vlm_id.setter
+    def fallback_guard_vlm_id(self, val: str):
+        self.fallback_guard_id = val
 
     # Execution Mode
     quick_test: bool = False
     full_run: bool = False
     resume: bool = True
-    stage: str = "all"  # 'all', 'data', 'encoder', 'vlm', 'e2e', 'eval'
+    stage: str = "all"  # 'all', 'data', 'guard', 'e2e', 'eval'
 
     # Dataset & Poisoning Settings
     val_split_ratio: float = 0.20
@@ -132,19 +154,13 @@ class ExperimentConfig:
     poison_detection_threshold: float = 0.65  # Threshold for Self-Filtering Sanitizer
 
     # Defense Thresholds
-    cascade_low_threshold: float = 0.15     # Safe boundary
-    cascade_high_threshold: float = 0.85    # Jailbreak boundary
+    cascade_reflex_low: float = 0.10        # Fast reflexivity screen lower bound
+    cascade_reflex_high: float = 0.90       # Fast reflexivity screen upper bound
     guard_decision_threshold: float = 0.50  # Final Gatekeeper binary threshold
-    lookahead_band_min: float = 0.40        # Gray-zone lower bound for 10-token lookahead
-    lookahead_band_max: float = 0.70        # Gray-zone upper bound for 10-token lookahead
+    lookahead_band_min: float = 0.35        # Gray-zone lower bound for 10-token lookahead
     lookahead_tokens: int = 10
 
-    # Training Hyperparameters
-    encoder_epochs: int = 2
-    encoder_lr: float = 2e-5
-    encoder_batch_size: int = 16
-    encoder_max_length: int = 256
-
+    # Training Hyperparameters for Qwen3.5-2B QLoRA
     vlm_epochs: int = 1
     vlm_lr: float = 1e-4
     vlm_batch_size: int = 2
@@ -167,17 +183,22 @@ class ExperimentConfig:
         if self.drive_backup_dir is None:
             self.drive_backup_dir = detect_colab_drive_backup_dir()
 
-        # Adjust batch size and precision for CPU if CUDA is not available
+        # Adjust for CPU if CUDA is not available
         if self.hardware.device == "cpu":
-            self.encoder_batch_size = 4
             self.vlm_batch_size = 1
             self.vlm_gradient_accumulation_steps = 1
             self.vlm_params.load_in_4bit = False
             self.vlm_params.bnb_4bit_compute_dtype = "float32"
             if not self.quick_test:
-                self.quick_test = True  # Auto-fallback to quick_test on CPU to prevent freeze
+                self.quick_test = True
+
+
+# Global aliases matching prompt
+GUARD_MODEL_ID = "Qwen/Qwen3.5-2B"
+TARGET_MODEL_ID = "Qwen/Qwen3.5-4B"
+VLM_MIN_PIXELS = 128 * 28 * 28
+VLM_MAX_PIXELS = 384 * 28 * 28
 
 
 def get_default_config() -> ExperimentConfig:
     return ExperimentConfig()
-

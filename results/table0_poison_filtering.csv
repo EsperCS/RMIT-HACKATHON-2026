@@ -3,6 +3,6 @@ Poison Detection Precision,100.00%
 Poison Detection Recall,0.00%
 Poison Detection F1-Score,0.0000
 Poisoned Samples Cleaned,0 / 2
-VLM ROC-AUC (Trained on Noisy Data),0.5216
-VLM ROC-AUC (Trained on Cleaned Data),0.5586
-ROC-AUC Delta (Gain from Sanitization),+0.0370
+VLM ROC-AUC (Trained on Noisy Data),0.3179
+VLM ROC-AUC (Trained on Cleaned Data),0.3395
+ROC-AUC Delta (Gain from Sanitization),+0.0216

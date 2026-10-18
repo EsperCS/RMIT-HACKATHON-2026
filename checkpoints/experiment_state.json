@@ -2,7 +2,8 @@
   "completed_steps": [
     "data_prep",
     "encoder_round_1",
-    "vlm_round_1"
+    "vlm_round_1",
+    "guard_round_1"
   ],
   "step_metadata": {
     "data_prep": {
