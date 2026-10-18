@@ -113,7 +113,7 @@ class ExperimentConfig:
     preferred_encoder_id: str = "FacebookAI/xlm-roberta-base"
     fallback_encoder_id: str = "microsoft/deberta-v3-base"
 
-    preferred_guard_vlm_id: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    preferred_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
     fallback_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
     cpu_mock_guard_vlm_id: str = "Qwen/Qwen2-VL-2B-Instruct"
 

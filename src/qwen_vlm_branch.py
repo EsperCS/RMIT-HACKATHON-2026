@@ -65,8 +65,8 @@ class QwenVLMBranch:
             return
 
         try:
-            from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, BitsAndBytesConfig
-            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+            import transformers
+            from transformers import AutoProcessor, BitsAndBytesConfig
             
             logger.info(f"[VLM Branch] Loading VLM: {self.model_id} in 4-bit NF4...")
             bnb_config = BitsAndBytesConfig(
@@ -76,28 +76,32 @@ class QwenVLMBranch:
                 bnb_4bit_use_double_quant=self.config.vlm_params.bnb_4bit_use_double_quant
             )
             
-            self.processor = AutoProcessor.from_pretrained(
-                self.model_id,
-                min_pixels=self.config.vlm_params.min_pixels,
-                max_pixels=self.config.vlm_params.max_pixels
-            )
-            self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            # Select proper model class dynamically based on model_type
+            model_cls = None
+            for candidate_name in ["Qwen2VLForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration", "AutoModelForImageTextToText", "AutoModelForVision2Seq"]:
+                if hasattr(transformers, candidate_name):
+                    model_cls = getattr(transformers, candidate_name)
+                    break
+            if model_cls is None:
+                from transformers import AutoModelForVision2Seq
+                model_cls = AutoModelForVision2Seq
+            
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    self.model_id,
+                    min_pixels=self.config.vlm_params.min_pixels,
+                    max_pixels=self.config.vlm_params.max_pixels
+                )
+            except Exception:
+                self.processor = AutoProcessor.from_pretrained(self.model_id)
+
+            self.model = model_cls.from_pretrained(
                 self.model_id,
                 quantization_config=bnb_config,
                 device_map="auto"
             )
-            
-            # Setup LoRA
-            lora_cfg = LoraConfig(
-                r=self.config.lora_params.r,
-                lora_alpha=self.config.lora_params.lora_alpha,
-                lora_dropout=self.config.lora_params.lora_dropout,
-                target_modules=self.config.lora_params.target_modules,
-                task_type="CAUSAL_LM"
-            )
-            self.model = prepare_model_for_kbit_training(self.model)
-            self.model = get_peft_model(self.model, lora_cfg)
-            logger.info("[VLM Branch] Successfully loaded Qwen2-VL with 4-bit LoRA adapter.")
+            self.model.eval()
+            logger.info(f"[VLM Branch] Successfully loaded {self.model_id} with {model_cls.__name__}.")
             
             # Cache Token IDs for "SAFE" and "UNSAFE"
             tokenizer = self.processor.tokenizer
@@ -105,8 +109,30 @@ class QwenVLMBranch:
             self.unsafe_token_id = tokenizer.encode("UNSAFE", add_special_tokens=False)[-1]
             
         except Exception as e:
-            logger.warning(f"[VLM Branch] Could not initialize full GPU VLM ({e}). Falling back to CPU Multimodal Engine.")
-            self._init_cpu_engine()
+            logger.warning(f"[VLM Branch] Primary model load failed ({e}). Attempting fallback to {self.config.fallback_guard_vlm_id}...")
+            try:
+                self.model_id = self.config.fallback_guard_vlm_id
+                from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, BitsAndBytesConfig
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True
+                )
+                self.processor = AutoProcessor.from_pretrained(self.model_id)
+                self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+                    self.model_id,
+                    quantization_config=bnb_config,
+                    device_map="auto"
+                )
+                self.model.eval()
+                tokenizer = self.processor.tokenizer
+                self.safe_token_id = tokenizer.encode("SAFE", add_special_tokens=False)[-1]
+                self.unsafe_token_id = tokenizer.encode("UNSAFE", add_special_tokens=False)[-1]
+                logger.info(f"[VLM Branch] Fallback model loaded successfully: {self.model_id}")
+            except Exception as e2:
+                logger.warning(f"[VLM Branch] GPU VLM initialization failed ({e2}). Falling back to CPU Multimodal Engine.")
+                self._init_cpu_engine()
 
     def _init_cpu_engine(self):
         """Initializes a lightweight multimodal neural classifier for CPU / quick_test."""
@@ -157,6 +183,8 @@ class QwenVLMBranch:
                     probs.append(p)
         else:
             self.model.eval()
+            model_device = next(self.model.parameters()).device
+            
             with torch.no_grad():
                 for idx, row in df.iterrows():
                     prompt = row["prompt"]
@@ -171,16 +199,34 @@ class QwenVLMBranch:
                             ]
                         }
                     ]
-                    text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    inputs = self.processor(text=[text_input], images=[img], return_tensors="pt").to(self.device)
                     
-                    outputs = self.model(**inputs)
-                    last_logits = outputs.logits[0, -1, :]
-                    z_unsafe = last_logits[self.unsafe_token_id].item()
-                    z_safe = last_logits[self.safe_token_id].item()
+                    try:
+                        from qwen_vl_utils import process_vision_info
+                        image_inputs, video_inputs = process_vision_info(messages)
+                        text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self.processor(
+                            text=[text_input],
+                            images=image_inputs,
+                            videos=video_inputs,
+                            padding=True,
+                            return_tensors="pt"
+                        )
+                    except Exception:
+                        text_input = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self.processor(text=[text_input], images=[img], return_tensors="pt")
+
+                    inputs = {k: v.to(model_device) if hasattr(v, "to") else v for k, v in inputs.items()}
                     
-                    # Sigmoid difference
-                    prob = 1.0 / (1.0 + np.exp(-(z_unsafe - z_safe)))
+                    try:
+                        outputs = self.model(**inputs)
+                        last_logits = outputs.logits[0, -1, :]
+                        z_unsafe = last_logits[self.unsafe_token_id].item()
+                        z_safe = last_logits[self.safe_token_id].item()
+                        prob = float(1.0 / (1.0 + np.exp(-(z_unsafe - z_safe))))
+                    except Exception as err:
+                        logger.warning(f"[VLM Single-Step Warning] Query {idx} error ({err}), falling back to 0.5")
+                        prob = 0.5
+                        
                     probs.append(prob)
 
         elapsed = time.perf_counter() - start_time
