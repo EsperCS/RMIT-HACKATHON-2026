@@ -16,7 +16,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from config import CHECKPOINTS_DIR, ExperimentConfig
-from src.utils import cleanup_vram, get_peak_vram_mb
+from src.utils import cleanup_vram, get_peak_vram_mb, resolve_image_path
 from src.text_features import extract_reflexivity_features_batch
 
 logger = logging.getLogger("Gatekeeper")
@@ -28,9 +28,10 @@ logger = logging.getLogger("Gatekeeper")
 
 def safe_load_image(img_path: Optional[str]) -> Image.Image:
     """Safely loads an image or returns a neutral 224x224 RGB image."""
-    if img_path and os.path.exists(img_path):
+    resolved = resolve_image_path(img_path)
+    if resolved and resolved.exists():
         try:
-            return Image.open(img_path).convert("RGB")
+            return Image.open(resolved).convert("RGB")
         except Exception:
             pass
     return Image.new("RGB", (224, 224), color=(250, 250, 250))

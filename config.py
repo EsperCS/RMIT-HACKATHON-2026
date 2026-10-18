@@ -20,14 +20,14 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Directory Paths
 DATA_DIR = BASE_DIR / "data"
-FRIEND_DROPS_DIR = DATA_DIR / "friend_drops"
+DOWNLOADS_DIR = DATA_DIR / "downloads"
 SYNTHETIC_IMAGES_DIR = DATA_DIR / "synthetic_images"
 PROCESSED_DATA_DIR = DATA_DIR / "processed"
 CHECKPOINTS_DIR = BASE_DIR / "checkpoints"
 RESULTS_DIR = BASE_DIR / "results"
 
 # Ensure all primary directories exist
-for directory in [DATA_DIR, FRIEND_DROPS_DIR, SYNTHETIC_IMAGES_DIR, PROCESSED_DATA_DIR, CHECKPOINTS_DIR, RESULTS_DIR]:
+for directory in [DATA_DIR, DOWNLOADS_DIR, SYNTHETIC_IMAGES_DIR, PROCESSED_DATA_DIR, CHECKPOINTS_DIR, RESULTS_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 # Colab Google Drive Auto-Detection Path

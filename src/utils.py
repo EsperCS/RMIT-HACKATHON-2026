@@ -15,7 +15,32 @@ from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import torch
 
-from config import CHECKPOINTS_DIR, RESULTS_DIR, HardwareConfig
+from config import BASE_DIR, SYNTHETIC_IMAGES_DIR, DOWNLOADS_DIR, CHECKPOINTS_DIR, RESULTS_DIR, HardwareConfig
+
+
+def resolve_image_path(img_path: Optional[str]) -> Optional[Path]:
+    """
+    Cross-platform image path resolver.
+    Handles relative paths, absolute paths from another machine, and filename-only lookups.
+    """
+    if not img_path:
+        return None
+    p = Path(img_path)
+    if p.is_file() and p.exists():
+        return p
+    # Relative to repository base directory
+    cand1 = BASE_DIR / p
+    if cand1.is_file() and cand1.exists():
+        return cand1
+    # Check by filename inside synthetic_images/
+    cand2 = SYNTHETIC_IMAGES_DIR / p.name
+    if cand2.is_file() and cand2.exists():
+        return cand2
+    # Check by filename inside downloads/
+    cand3 = DOWNLOADS_DIR / p.name
+    if cand3.is_file() and cand3.exists():
+        return cand3
+    return None
 
 # Setup unbuffered real-time logging
 logging.basicConfig(

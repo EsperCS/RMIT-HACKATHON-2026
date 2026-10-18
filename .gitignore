@@ -39,12 +39,13 @@ checkpoints/*
 data/processed/*
 !data/processed/.gitkeep
 
+# Downloaded benchmark datasets (cached locally, re-downloadable)
+data/downloads/*
+!data/downloads/.gitkeep
+
 # Synthetic generated images (generated on the fly)
 data/synthetic_images/*
 !data/synthetic_images/.gitkeep
-
-# Friend drops (keep .gitkeep, ignore temporary local large data if needed, but teammates can push small csvs)
-!data/friend_drops/.gitkeep
 
 # Keep results CSV and figures in Git for benchmarking
 !results/*.csv
