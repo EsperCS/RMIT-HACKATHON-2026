@@ -15,8 +15,8 @@ echo "=========================================================="
 echo " [2/3] Installing Required Libraries (Qwen3.5 Multimodal)..."
 echo "=========================================================="
 pip install --quiet --upgrade pip
+pip install --quiet "git+https://github.com/huggingface/transformers.git" || pip install --quiet "transformers>=4.48.0"
 pip install --quiet \
-    "transformers>=4.48.0" \
     "accelerate>=0.34.0" \
     "peft>=0.13.0" \
     "trl>=0.11.0" \
@@ -33,7 +33,7 @@ pip install --quiet \
 echo "=========================================================="
 echo " [3/3] Verifying Key Imports for Qwen3.5-2B..."
 echo "=========================================================="
-python3 -c "import transformers, peft, bitsandbytes, qwen_vl_utils, sklearn; print(f'Transformers: {transformers.__version__} | All packages verified!')"
+python3 -c "import transformers, peft, bitsandbytes, qwen_vl_utils, sklearn; print(f'Transformers: {transformers.__version__} (Qwen3.5 native: {hasattr(transformers, \"Qwen3_5ForConditionalGeneration\")}) | All packages verified!')"
 
 echo "=========================================================="
 echo " Setup Completed! You can now run:"
