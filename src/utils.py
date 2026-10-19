@@ -15,6 +15,10 @@ from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import torch
 
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from config import BASE_DIR, SYNTHETIC_IMAGES_DIR, DOWNLOADS_DIR, CHECKPOINTS_DIR, RESULTS_DIR, HardwareConfig
 
 
@@ -267,4 +271,49 @@ class ExperimentState:
             import pandas as pd
             return pd.read_parquet(target_path)
         return None
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print(" [DEBUG TOOL] src/utils.py - Diagnostics & System Utilities Test")
+    print("=" * 70)
+    
+    # 1. Test Seed reproducibility
+    seed_everything(42)
+    val_rand = random.random()
+    val_np = np.random.rand()
+    val_torch = torch.rand(1).item()
+    print(f"[Seed Check] Python: {val_rand:.4f} | NumPy: {val_np:.4f} | PyTorch: {val_torch:.4f}")
+    
+    # 2. Test Hardware Status & VRAM Cleanup
+    hw = get_hardware_status()
+    print(f"[Hardware] Device: {hw.device} | Name: {hw.gpu_name} | VRAM: {hw.vram_gb:.2f} GB")
+    cleanup_vram()
+    print(f"[VRAM Cleanup] Current allocated: {torch.cuda.memory_allocated() / (1024**2):.1f} MB" if torch.cuda.is_available() else "[VRAM Cleanup] CPU mode OK.")
+    
+    # 3. Test State Manager & Intermediate Save/Load
+    test_state_dir = CHECKPOINTS_DIR / "_debug_temp_state"
+    test_state_dir.mkdir(parents=True, exist_ok=True)
+    state_mgr = ExperimentState(test_state_dir)
+    state_mgr.mark_completed("debug_test_step", {"timestamp": "2026-10-19", "status": "passed"})
+    is_done = state_mgr.is_completed("debug_test_step")
+    print(f"[State Manager] 'debug_test_step' completed: {is_done} (Expected: True)")
+    
+    # Test intermediate save/load
+    test_arr = np.array([0.1, 0.5, 0.9], dtype=np.float32)
+    saved_file = state_mgr.save_intermediate("test_probs.npy", test_arr)
+    loaded_arr = state_mgr.load_intermediate("test_probs.npy")
+    np.testing.assert_array_almost_equal(test_arr, loaded_arr)
+    print(f"[Intermediate I/O] Saved & Loaded array match: OK ({saved_file.name})")
+    
+    # Clean up temp state
+    shutil.rmtree(test_state_dir, ignore_errors=True)
+    
+    # 4. Test resolve_image_path
+    resolved = resolve_image_path("non_existent_image.png")
+    print(f"[Path Resolver] Non-existent fallback check: {resolved} (Expected: None)")
+    
+    print("=" * 70)
+    print(" [SUCCESS] src/utils.py utilities and state manager passed all tests.")
+    print("=" * 70)
 

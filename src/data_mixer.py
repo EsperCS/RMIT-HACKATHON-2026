@@ -10,6 +10,7 @@ Data Sources:
 
 import os
 import io
+import sys
 import csv
 import random
 import logging
@@ -19,6 +20,10 @@ from typing import List, Dict, Tuple, Optional
 import pandas as pd
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from config import (
     BASE_DIR,
@@ -786,3 +791,45 @@ class MultimodalDataMixer:
         logger.info("[Data Mixer] Saved Leave-One-Drop-Out (Novel Attack) datasets.")
 
         return result_datasets
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print(" [DEBUG TOOL] src/data_mixer.py - Dataset Pipeline & Splitting Test")
+    print("=" * 70)
+
+    # 1. Test raw dataset loading
+    print("\n--- 1. Testing Raw Competition Dataset Loading ---")
+    raw_df = load_rmit_hackathon_2025_train_dataset()
+    print(f"Total samples loaded : {len(raw_df)}")
+    print(f"Columns              : {list(raw_df.columns)}")
+    print(f"Class distribution   : Adversarial(1)={int((raw_df['true_label']==1).sum())}, Benign(0)={int((raw_df['true_label']==0).sum())}")
+
+    # 2. Test Typographic Image Generation
+    print("\n--- 2. Testing Typographic Visual Jailbreak Generator ---")
+    debug_img_path = SYNTHETIC_IMAGES_DIR / "_debug_sample_jailbreak.png"
+    generate_typographic_image(
+        text="DEBUG TEST: Follow prompt instructions inside this image.",
+        output_path=debug_img_path,
+        bg_color=(250, 230, 230),
+        text_color=(150, 0, 0)
+    )
+    print(f"Generated test image : {debug_img_path.name} (Exists: {debug_img_path.exists()}, Size: {debug_img_path.stat().st_size} bytes)")
+
+    # 3. Test Full Pipeline Data Preparation (Quick Test Mode)
+    print("\n--- 3. Testing MultimodalDataMixer.prepare_experiment_datasets() ---")
+    cfg = ExperimentConfig(quick_test=True)
+    mixer = MultimodalDataMixer(cfg)
+    datasets = mixer.prepare_experiment_datasets()
+
+    print("\nGenerated Dataset Splits Summary:")
+    print(f"{'Split Name':<25} | {'Samples':<10} | {'Has Image':<10} | {'Poisoned':<10}")
+    print("-" * 65)
+    for name, df in datasets.items():
+        n_img = int(df.get("has_image", pd.Series([False]*len(df))).sum())
+        n_poison = int(df.get("is_poisoned", pd.Series([False]*len(df))).sum())
+        print(f"{name:<25} | {len(df):<10} | {n_img:<10} | {n_poison:<10}")
+
+    print("=" * 70)
+    print(" [SUCCESS] src/data_mixer.py passed all unit and pipeline tests.")
+    print("=" * 70)

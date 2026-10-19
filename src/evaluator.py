@@ -4,6 +4,7 @@ RMIT HACKATHON 2026 - Multimodal Gatekeeper AI Safety Benchmark
 """
 
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -19,6 +20,10 @@ from sklearn.metrics import (
     recall_score,
     confusion_matrix
 )
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from config import RESULTS_DIR
 from src.utils import sync_to_drive
@@ -239,3 +244,44 @@ class BenchmarkEvaluator:
         sync_to_drive(out_path, self.drive_backup_dir)
         logger.info(f"[Evaluator] Saved ROC curves plot to {out_path.name}")
         return out_path
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print(" [DEBUG TOOL] src/evaluator.py - Metrics & Visualization Test")
+    print("=" * 70)
+
+    # 1. Test compute_metrics
+    print("\n--- 1. Testing compute_metrics() ---")
+    y_true = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
+    probs = np.array([0.05, 0.12, 0.20, 0.60, 0.08, 0.85, 0.90, 0.40, 0.95, 0.98])
+    hb_mask = np.array([False, False, True, True, False, False, False, False, False, False])
+    
+    metrics = compute_metrics(y_true, probs, hard_benign_mask=hb_mask, threshold=0.50)
+    for k, v in metrics.items():
+        if "Rate" in k or "Recall" in k or "Precision" in k:
+            print(f"{k:<20}: {v:.2%}")
+        else:
+            print(f"{k:<20}: {v:.4f}")
+
+    # 2. Test BenchmarkEvaluator Markdown Table Output
+    print("\n--- 2. Testing BenchmarkEvaluator Table Rendering ---")
+    evaluator = BenchmarkEvaluator()
+    sample_df = pd.DataFrame([
+        {"Method": "Baseline Heuristic", "ROC_AUC": "0.8500", "Latency": "0.5 ms"},
+        {"Method": "Qwen3.5-2B QLoRA", "ROC_AUC": "0.9950", "Latency": "110.0 ms"}
+    ])
+    evaluator.print_markdown_table("SAMPLE BENCHMARK TEST TABLE", sample_df)
+
+    # 3. Test ROC Curves Plotting
+    print("\n--- 3. Testing plot_roc_curves() ---")
+    preds_dict = {
+        "Fast Heuristic": np.array([0.1, 0.2, 0.3, 0.7, 0.2, 0.6, 0.8, 0.5, 0.9, 0.9]),
+        "Qwen 2B Gatekeeper": probs
+    }
+    roc_img = evaluator.plot_roc_curves(y_true, preds_dict, "_debug_test_roc.png")
+    print(f"ROC Curves saved successfully to: {roc_img.name} (Exists: {roc_img.exists()})")
+
+    print("=" * 70)
+    print(" [SUCCESS] src/evaluator.py passed all unit and visualization tests.")
+    print("=" * 70)

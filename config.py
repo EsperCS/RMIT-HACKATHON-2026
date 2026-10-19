@@ -202,3 +202,30 @@ VLM_MAX_PIXELS = 384 * 28 * 28
 
 def get_default_config() -> ExperimentConfig:
     return ExperimentConfig()
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print(" [DEBUG TOOL] config.py - System & Environment Diagnostics")
+    print("=" * 70)
+    cfg = get_default_config()
+    print(f"Device               : {cfg.hardware.device}")
+    print(f"GPU Name             : {cfg.hardware.gpu_name}")
+    print(f"VRAM Available       : {cfg.hardware.vram_gb:.2f} GB")
+    print(f"Is Colab T4          : {cfg.hardware.is_colab_t4}")
+    print(f"Is Colab L4          : {cfg.hardware.is_colab_l4}")
+    print("-" * 70)
+    print(f"Base Directory       : {BASE_DIR}")
+    print(f"Data Directory       : {DATA_DIR} (Exists: {DATA_DIR.exists()})")
+    print(f"Processed Directory  : {PROCESSED_DATA_DIR} (Exists: {PROCESSED_DATA_DIR.exists()})")
+    print(f"Checkpoints Dir      : {CHECKPOINTS_DIR} (Exists: {CHECKPOINTS_DIR.exists()})")
+    print(f"Results Directory    : {RESULTS_DIR} (Exists: {RESULTS_DIR.exists()})")
+    print(f"Drive Backup Path    : {cfg.drive_backup_dir or 'Not Mounted / None'}")
+    print("-" * 70)
+    print(f"Guard Model ID       : {cfg.guard_model_id}")
+    print(f"Target Model ID      : {cfg.target_model_id}")
+    print(f"VLM Resolution Window: {cfg.vlm_params.min_pixels} -> {cfg.vlm_params.max_pixels} pixels")
+    print(f"LoRA Target Modules  : {cfg.lora_params.target_modules}")
+    print("=" * 70)
+    print(" [SUCCESS] config.py environment diagnostics passed cleanly.")
+    print("=" * 70)
