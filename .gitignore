@@ -46,6 +46,8 @@ data/friend_drops/*
 # Downloaded benchmark datasets (cached locally, re-downloadable)
 data/downloads/*
 !data/downloads/.gitkeep
+!data/downloads/rmit-hackathon-2025/
+!data/downloads/rmit-hackathon-2025/*.csv
 
 # Synthetic generated images (generated on the fly)
 data/synthetic_images/*

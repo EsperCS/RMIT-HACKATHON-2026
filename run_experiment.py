@@ -8,6 +8,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
+from typing import Optional, List, Dict, Tuple
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
@@ -22,7 +23,7 @@ from src.utils import (
     get_peak_vram_mb,
     reset_peak_vram
 )
-from src.data_mixer import MultimodalDataMixer
+from src.data_mixer import MultimodalDataMixer, load_rmit_hackathon_2025_test_dataset
 from src.text_features import ReflexivityClassifier
 from src.qwen_vlm_branch import QwenVLMBranch
 from src.hybrid_defenses import (
@@ -40,13 +41,19 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Multimodal Gatekeeper AI Safety Benchmark CLI")
     parser.add_argument("--quick_test", action="store_true", help="Run fast 2-3 minute verification test with small sample cap")
     parser.add_argument("--full_run", action="store_true", help="Run comprehensive benchmark on all data")
-    parser.add_argument("--stage", type=str, default="all", choices=["all", "data", "guard", "e2e", "eval"],
+    parser.add_argument("--stage", type=str, default="all", choices=["all", "data", "guard", "e2e", "eval", "submission"],
                         help="Execute a specific stage of the pipeline")
     parser.add_argument("--resume", action="store_true", default=True, help="Auto-resume from last completed checkpoint")
     parser.add_argument("--no_resume", dest="resume", action="store_false", help="Disable auto-resume and run all from scratch")
     parser.add_argument("--val", action="store_true", help="Evaluate benchmark on the 500 validation samples (val.parquet)")
     parser.add_argument("--eval_split", type=str, default="test", choices=["test", "val"],
                         help="Choose evaluation target: 'test' (global_test.parquet) or 'val' (val.parquet)")
+    parser.add_argument("--predict_test", action="store_true",
+                        help="Run inference on competition test.csv and generate submission.csv")
+    parser.add_argument("--test_file", type=str, default=None,
+                        help="Explicit path to competition test.csv")
+    parser.add_argument("--sample_submission", type=str, default=None,
+                        help="Explicit path to competition sample_submission.csv")
     parser.add_argument("--drive_backup_dir", type=str, default=None, help="Custom Google Drive backup directory path")
     parser.add_argument("--guard_model", type=str, default=None, help="Override HuggingFace guard VLM model ID")
     parser.add_argument("--target_model", type=str, default=None, help="Override HuggingFace target LLM model ID")
@@ -381,6 +388,155 @@ def main():
         logger.info(f" Results mirrored to Google Drive: {config.drive_backup_dir}")
     logger.info("====================================================================")
 
+    # =========================================================================
+    # STAGE 6: Competition Submission Generation on test.csv
+    # =========================================================================
+    if args.full_run or args.predict_test or (args.test_file is not None):
+        generate_competition_submission(
+            config=config,
+            reflex_clf=reflex_clf,
+            vlm_branch=vlm_branch,
+            ensemble=ensemble,
+            cascade=cascade,
+            opt_thresh=opt_thresh_best,
+            evaluator=evaluator,
+            custom_test_file=args.test_file,
+            custom_sub_file=args.sample_submission
+        )
+
+
+def generate_competition_submission(
+    config,
+    reflex_clf: ReflexivityClassifier,
+    vlm_branch: QwenVLMBranch,
+    ensemble: MultiSignalRankEnsemble,
+    cascade: CascadeGatekeeper,
+    opt_thresh: float,
+    evaluator: BenchmarkEvaluator,
+    custom_test_file: Optional[str] = None,
+    custom_sub_file: Optional[str] = None
+):
+    """
+    Executes end-to-end inference on the official competition test.csv,
+    generates submission.csv matching sample_submission.csv schema,
+    saves to results/ and mirrors to Google Drive.
+    """
+    logger.info("")
+    logger.info("====================================================================")
+    logger.info(" >>> [STAGE 6] Generating Competition Submission on test.csv...")
+    logger.info("====================================================================")
+
+    test_df, sample_sub, test_path, sub_path = load_rmit_hackathon_2025_test_dataset(
+        custom_test_path=custom_test_file,
+        custom_sub_path=custom_sub_file
+    )
+
+    if test_df is None or len(test_df) == 0:
+        logger.warning(
+            "[Submission] test.csv not found in candidate paths. "
+            "Please ensure test.csv is placed in data/downloads/rmit-hackathon-2025/ "
+            "or provide --test_file <path_to_test.csv>."
+        )
+        return
+
+    logger.info(f"[Submission] Loaded test dataset: {len(test_df)} samples from {test_path}")
+    if sample_sub is not None:
+        logger.info(f"[Submission] Loaded reference sample_submission: {len(sample_sub)} samples from {sub_path}")
+        logger.info(f"[Submission] Submission columns format: {list(sample_sub.columns)}")
+
+    # 1. Tier 1 Reflexivity Classifier
+    logger.info("[Submission] 1/5 Computing Fast Reflexivity Probabilities...")
+    p_reflex = reflex_clf.predict_proba(test_df["prompt"].tolist())
+
+    # 2. Tier 2 Qwen3.5-2B QLoRA Guard
+    logger.info("[Submission] 2/5 Computing Qwen3.5-2B QLoRA Logits...")
+    p_qlora, vlm_latency = vlm_branch.predict_logits_single_step(test_df)
+
+    # 3. Zero-shot Signal
+    logger.info("[Submission] 3/5 Computing Zero-shot Anchor Signal...")
+    if hasattr(vlm_branch.model, "disable_adapter"):
+        try:
+            with vlm_branch.model.disable_adapter():
+                p_zero, _ = vlm_branch.predict_logits_single_step(test_df)
+        except Exception:
+            p_zero = p_qlora
+    else:
+        p_zero = p_qlora
+
+    # 4. OOD Anomaly Scores
+    logger.info("[Submission] 4/5 Computing OOD Anomaly Scores...")
+    p_ood = vlm_branch.compute_ood_scores(test_df)
+
+    # 5. Multi-Signal Ensemble & Cascade
+    logger.info("[Submission] 5/5 Applying Optimized Ensemble & Cascade Gatekeeper...")
+    p_ensemble = ensemble.predict(p_qlora, p_zero, p_ood, p_reflex)
+    p_cascade, stages, t1_pct, avg_lat = cascade.evaluate_cascade(
+        test_df, p_reflex, p_ensemble, reflex_latency_ms=0.5, deep_latency_ms=vlm_latency
+    )
+
+    # 6. Build Submission DataFrame matching sample_submission.csv
+    target_col = "TARGET"
+    id_col = "Id"
+    if sample_sub is not None and len(sample_sub.columns) >= 2:
+        id_col = sample_sub.columns[0]
+        target_col = sample_sub.columns[1]
+
+    # Map predictions by Id to preserve exact row ordering from sample_submission.csv
+    pred_map = dict(zip(test_df["Id"], np.round(p_cascade, 6)))
+    if sample_sub is not None:
+        submission_df = pd.DataFrame()
+        submission_df[id_col] = sample_sub[id_col]
+        submission_df[target_col] = sample_sub[id_col].map(pred_map).fillna(0.5)
+    else:
+        submission_df = pd.DataFrame({
+            id_col: test_df["Id"],
+            target_col: np.round(p_cascade, 6)
+        })
+
+    # Validate output
+    assert len(submission_df) == len(test_df), f"Row count mismatch: {len(submission_df)} vs {len(test_df)}"
+    assert not submission_df.isna().any().any(), "Submission DataFrame contains NaN values!"
+
+    # 7. Save Submission Files
+    sub_primary = RESULTS_DIR / "submission.csv"
+    sub_probs = RESULTS_DIR / "submission_probabilities.csv"
+    sub_binary = RESULTS_DIR / "submission_binary.csv"
+
+    submission_df.to_csv(sub_primary, index=False)
+    submission_df.to_csv(sub_probs, index=False)
+
+    sub_binary_df = submission_df.copy()
+    sub_binary_df[target_col] = (submission_df[target_col] >= opt_thresh).astype(int)
+    sub_binary_df.to_csv(sub_binary, index=False)
+
+    evaluator.save_and_sync_table("submission.csv", submission_df)
+    evaluator.save_and_sync_table("submission_probabilities.csv", submission_df)
+    evaluator.save_and_sync_table("submission_binary.csv", sub_binary_df)
+
+    # 8. Print Official Submission Report
+    banner = "=" * 80
+    logger.info(f"\n{banner}\n COMPETITION SUBMISSION GENERATED SUCCESSFULLY\n{banner}")
+    logger.info(f" Primary Submission File : {sub_primary}")
+    logger.info(f" Binary Sub File         : {sub_binary} (Optimal Threshold: {opt_thresh:.4f})")
+    if config.drive_backup_dir:
+        logger.info(f" Mirrored to Drive       : {config.drive_backup_dir}/submission.csv")
+    logger.info(f" Total Rows              : {len(submission_df)}")
+    logger.info(f" Columns Format          : {list(submission_df.columns)}")
+    logger.info(
+        f" Probability Stats       : Min={submission_df[target_col].min():.4f} | "
+        f"Mean={submission_df[target_col].mean():.4f} | "
+        f"Median={submission_df[target_col].median():.4f} | "
+        f"Max={submission_df[target_col].max():.4f}"
+    )
+    logger.info(f" Tier 1 Fast Screened    : {t1_pct:.1%}")
+    logger.info(f" Tier 2 Deep VLM         : {100.0 - t1_pct:.1%}")
+    logger.info(f" Avg Test Latency        : {avg_lat:.2f} ms/query")
+    logger.info("-" * 80)
+    logger.info(" Preview First 10 Rows (submission.csv):")
+    logger.info("\n" + submission_df.head(10).to_string(index=False))
+    logger.info(f"{banner}\n")
+
 
 if __name__ == "__main__":
     main()
+

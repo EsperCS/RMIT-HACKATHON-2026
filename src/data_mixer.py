@@ -664,6 +664,109 @@ def load_rmit_hackathon_2025_train_dataset() -> pd.DataFrame:
     return std_df
 
 
+def load_rmit_hackathon_2025_test_dataset(
+    custom_test_path: Optional[str] = None,
+    custom_sub_path: Optional[str] = None
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[Path], Optional[Path]]:
+    """
+    Finds and loads the official competition test set (test.csv) and sample_submission.csv.
+    Standardizes test_df to include: ['Id', 'prompt', 'has_image', 'image_path'].
+    Returns:
+      (test_df, sample_sub_df, test_file_path, sample_sub_path)
+    """
+    test_file: Optional[Path] = None
+    sub_file: Optional[Path] = None
+
+    if custom_test_path and Path(custom_test_path).is_file():
+        test_file = Path(custom_test_path)
+    if custom_sub_path and Path(custom_sub_path).is_file():
+        sub_file = Path(custom_sub_path)
+
+    candidate_dirs = [
+        DOWNLOADS_DIR / "rmit-hackathon-2025",
+        BASE_DIR / "data" / "downloads" / "rmit-hackathon-2025",
+        Path.home() / ".cache" / "kagglehub" / "competitions" / "rmit-hackathon-2025",
+        Path("/kaggle/input/rmit-hackathon-2025"),
+        Path("/content/rmit-hackathon-2025"),
+        Path("/content"),
+        BASE_DIR / "data" / "raw",
+        BASE_DIR / "data",
+        BASE_DIR,
+        Path("C:/Users/Esper/Downloads/rmit-hackathon-2025")
+    ]
+
+    # Search for test_file
+    if test_file is None:
+        for cdir in candidate_dirs:
+            if cdir.exists() and cdir.is_dir():
+                for ext in [".csv", ".parquet"]:
+                    for f in cdir.rglob(f"*{ext}"):
+                        fname = f.name.lower()
+                        if "test" in fname and "sample" not in fname and "sub" not in fname and "global" not in fname:
+                            test_file = f
+                            break
+                    if test_file is not None:
+                        break
+            if test_file is not None:
+                break
+
+    # Search for sample_sub_file
+    if sub_file is None:
+        for cdir in candidate_dirs:
+            if cdir.exists() and cdir.is_dir():
+                for ext in [".csv"]:
+                    for f in cdir.rglob(f"*{ext}"):
+                        fname = f.name.lower()
+                        if any(k in fname for k in ["sample_submission", "submission", "sample_sub"]):
+                            sub_file = f
+                            break
+                    if sub_file is not None:
+                        break
+            if sub_file is not None:
+                break
+
+    test_df: Optional[pd.DataFrame] = None
+    sample_sub_df: Optional[pd.DataFrame] = None
+
+    if test_file and test_file.exists():
+        try:
+            raw_test = pd.read_parquet(test_file) if test_file.suffix == ".parquet" else pd.read_csv(test_file)
+            id_col = None
+            for col in ["Id", "id", "ID", "index"]:
+                if col in raw_test.columns:
+                    id_col = col
+                    break
+            if id_col is None:
+                id_col = raw_test.columns[0]
+
+            text_col = None
+            for col in ["text", "prompt", "content", "query", "user_input", "instruction"]:
+                if col in raw_test.columns:
+                    text_col = col
+                    break
+            if text_col is None:
+                text_col = raw_test.columns[1] if len(raw_test.columns) > 1 else raw_test.columns[0]
+
+            test_df = pd.DataFrame({
+                "Id": raw_test[id_col],
+                "prompt": raw_test[text_col].fillna("").astype(str),
+                "has_image": False,
+                "image_path": ""
+            })
+            logger.info(f"[Data Mixer] Loaded competition test set: {len(test_df)} rows from {test_file}")
+        except Exception as e:
+            logger.error(f"[Data Mixer] Failed to read competition test file {test_file}: {e}")
+
+    if sub_file and sub_file.exists():
+        try:
+            sample_sub_df = pd.read_csv(sub_file)
+            logger.info(f"[Data Mixer] Loaded sample_submission reference: {len(sample_sub_df)} rows from {sub_file}")
+        except Exception as e:
+            logger.warning(f"[Data Mixer] Failed to read sample_submission file {sub_file}: {e}")
+
+    return test_df, sample_sub_df, test_file, sub_file
+
+
 # =============================================================================
 # 9. Main Data Mixer (Split 3500 Train, 500 Val, Remainder Test & Protocols)
 # =============================================================================
