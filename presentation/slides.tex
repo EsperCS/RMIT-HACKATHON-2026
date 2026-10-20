@@ -181,13 +181,13 @@
             \toprule
             \textbf{Sanitizer Metric} & \textbf{Observed Value} \\
             \midrule
-            Poison Detection Precision & \textbf{100.00\%} \\
+            Poison Detection Precision & \textbf{33.33\%} \\
             Poison Detection Recall & \textbf{100.00\%} (Catching injected poison) \\
-            Poison Detection F1-Score & \textbf{1.0000} \\
-            Model ROC-AUC on Dirty / Poisoned Data & 0.8729 \\
-            Model ROC-AUC on Cleaned Data & \textbf{0.9231} \\
+            Poison Detection F1-Score & \textbf{0.5000} \\
+            Model ROC-AUC on Dirty / Poisoned Data & 0.5960 \\
+            Model ROC-AUC on Cleaned Data & \textbf{0.5455} \\
             \midrule
-            \textbf{ROC-AUC Gain ($\Delta \text{AUC}$ from Sanitization)} & \textbf{+0.0502} (Prevents Over-refusal Collapse) \\
+            \textbf{ROC-AUC Gain ($\Delta \text{AUC}$ from Sanitization)} & \textbf{+-0.0505} (Prevents Over-refusal Collapse) \\
             \bottomrule
         \end{tabular}
     \end{table}
@@ -306,13 +306,13 @@
             \toprule
             \textbf{Method / Configuration} & \textbf{ROC\_AUC} & \textbf{F1\_Score} & \textbf{Recall (Detection)} & \textbf{Over-refusal (FPR)} & \textbf{Latency} & \textbf{Peak VRAM} \\
             \midrule
-            1. Reflexivity Heuristic Only & 0.9465 & 0.8696 & 76.92\% & \textbf{0.00\%} & \textbf{0.5 ms} & \textbf{0 MB} \\
-            2. Qwen3.5-2B Zero-shot & 0.9799 & 0.5556 & 38.46\% & \textbf{0.00\%} & 158.9 ms & 4359 MB \\
-            3. Qwen3.5-2B QLoRA (Dirty / Poisoned Data) & 0.8729 & 0.5000 & 92.31\% & 100.00\% \textcolor{RMITRed}{(Collapsed)} & 158.9 ms & 4359 MB \\
-            4. Qwen3.5-2B QLoRA (Cleaned Data) & 0.9231 & 0.6316 & 46.15\% & \textbf{0.00\%} & 158.9 ms & 4359 MB \\
+            1. Reflexivity Heuristic Only & 0.9596 & 0.9091 & 90.91\% & \textbf{0.00\%} & \textbf{0.5 ms} & \textbf{0 MB} \\
+            2. Qwen3.5-2B Zero-shot & 0.6465 & 0.0 & 0.00\% & 0.00\% & 0.6 ms & 0 MB \\
+            3. Qwen3.5-2B QLoRA (Dirty / Poisoned Data) & 0.596 & 0.1538 & 9.09\% & 25.00\% & 0.6 ms & 0 MB \\
+            4. Qwen3.5-2B QLoRA (Cleaned Data) & 0.5455 & 0.7097 & 100.00\% & \textbf{100.00\%} & 0.6 ms & 0 MB \\
             \midrule
             \rowcolor{LightCyan}
-            \textbf{5. Cascade \& Multi-Signal Ensemble} & \textbf{1.0000} & \textbf{0.9286} & \textbf{100.00\%} & \textbf{6.25\%} & \textbf{106.4 ms} & \textbf{4359 MB} \\
+            \textbf{5. Cascade \& Multi-Signal Ensemble} & \textbf{0.9697} & \textbf{0.8571} & \textbf{81.82\%} & \textbf{0.00\%} & \textbf{0.9 ms} & \textbf{0 MB} \\
             \bottomrule
         \end{tabular}
         }
@@ -339,11 +339,11 @@
                     \toprule
                     \textbf{Evaluation Protocol} & \textbf{ROC\_AUC} & \textbf{Detection} & \textbf{Over-refusal} \\
                     \midrule
-                    Continual Round 1 (Drop 1) & 1.0000 & 100.0\% & 0.0\% \\
-                    Continual Round 2 (Drop 1+2) & 1.0000 & 100.0\% & 0.0\% \\
-                    Continual Round 3 (Drop 1+2+3) & 1.0000 & 100.0\% & 0.0\% \\
+                    Continual Round 1 (Drop 1) & 1.0 & 100.0\% & 0.0\% \\
+                    Continual Round 2 (Drop 1+2) & 1.0 & 100.0\% & 0.0\% \\
+                    Continual Round 3 (Drop 1+2+3) & 0.9697 & 100.0\% & 0.0\% \\
                     \midrule
-                    \textbf{Leave-One-Drop-Out (Novel)} & \textbf{0.9330} & \textbf{37.5\%} & \textbf{0.0\%} \\
+                    \textbf{Leave-One-Drop-Out (Novel)} & \textbf{0.6339} & \textbf{100.0\%} & \textbf{100.0\%} \\
                     \bottomrule
                 \end{tabular}
             \end{table}
@@ -372,9 +372,9 @@
             \textbf{Defense Configuration} & \textbf{Attack Success Rate (ASR) $\downarrow$} & \textbf{Over-refusal (FPR) $\downarrow$} & \textbf{End-to-End Latency $\downarrow$} \\
             \midrule
             No Defense (Target 4B Only) & 100.00\% \textcolor{RMITRed}{(Vulnerable)} & 0.00\% & 180.0 ms \\
-            Standard Guard (Qwen3.5-2B) + Target 4B & 38.46\% & 0.00\% & 138.8 ms \\
+            Standard Guard (Qwen3.5-2B) + Target 4B & 100.00\% & 0.00\% & 180.0 ms \\
             \rowcolor{LightCyan}
-            \textbf{Cascade \& ProbGuard 10-Token Lookahead + Target 4B} & \textbf{0.00\%} \textcolor{SuccessGreen}{(Fully Blocked)} & \textbf{0.00\%} & \textbf{125.3 ms} \\
+            \textbf{Cascade \& ProbGuard 10-Token Lookahead + Target 4B} & \textbf{0.00\%} \textcolor{SuccessGreen}{(Fully Blocked)} & \textbf{0.00\%} & \textbf{74.5 ms} \\
             \bottomrule
         \end{tabular}
         }

@@ -41,10 +41,25 @@ pdflatex slides.tex
 
 ---
 
-## 3. Đồng bộ số liệu sau khi chạy `--full_run`
-Toàn bộ các bảng trong `slides.tex` đã được thiết kế sẵn đúng vị trí. Sau khi chạy:
+## 3. Tự động đồng bộ số liệu vào Slides (`slides.tex`)
+
+Toàn bộ 4 bảng trong `slides.tex` đã được kết nối tự động với các file kết quả thực nghiệm trong thư mục `results/`.
+
+### Cách 1: Tự động hoàn toàn sau khi chạy thực nghiệm
+Khi chạy thực nghiệm xong:
 ```bash
 python main.py --full_run
 ```
-Bạn chỉ cần mở `slides.tex`, đối chiếu các con số trong `results/table*.csv` và cập nhật nếu cần.
+Hệ thống sẽ **tự động cập nhật trực tiếp** các con số mới nhất vào file `presentation/slides.tex`.
+
+### Cách 2: Cập nhật thủ công bất cứ lúc nào
+Nếu bạn đã có các file `results/table*.csv` và chỉ muốn đồng bộ vào slide:
+```bash
+python main.py --update_slides
+```
+Hoặc:
+```bash
+python presentation/update_slides.py
+```
+*(Nếu muốn cập nhật số liệu của tập Validation 500 mẫu: thêm cờ `--val`: `python main.py --update_slides --val`)*.
 

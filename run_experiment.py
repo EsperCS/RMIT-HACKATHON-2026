@@ -57,11 +57,20 @@ def parse_args():
     parser.add_argument("--drive_backup_dir", type=str, default=None, help="Custom Google Drive backup directory path")
     parser.add_argument("--guard_model", type=str, default=None, help="Override HuggingFace guard VLM model ID")
     parser.add_argument("--target_model", type=str, default=None, help="Override HuggingFace target LLM model ID")
+    parser.add_argument("--update_slides", action="store_true",
+                        help="Synchronize results/*.csv tables directly into presentation/slides.tex")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Direct utility: update presentation slides from existing CSV results
+    if args.update_slides:
+        from presentation.update_slides import update_presentation_slides
+        update_presentation_slides(use_val=args.val or (args.eval_split == "val"))
+        return
+
     config = get_default_config()
 
     # Apply CLI Overrides
@@ -403,6 +412,13 @@ def main():
             custom_test_file=args.test_file,
             custom_sub_file=args.sample_submission
         )
+
+    # Auto-synchronize LaTeX Presentation slides with generated CSV results
+    try:
+        from presentation.update_slides import update_presentation_slides
+        update_presentation_slides(use_val=(eval_split == "val"))
+    except Exception as e:
+        logger.debug(f"Could not auto-sync presentation slides: {e}")
 
 
 def generate_competition_submission(
