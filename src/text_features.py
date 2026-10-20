@@ -54,14 +54,18 @@ def reconstruct_spaced_words(text: str) -> str:
 
 
 def try_decode_base64(candidate: str) -> str:
-    """Attempts to decode a base64 string if it contains valid UTF-8 text."""
+    """Attempts to decode a base64 string if it contains valid readable text."""
     candidate = candidate.strip()
     if len(candidate) < 12:
         return ""
     try:
         decoded_bytes = base64.b64decode(candidate, validate=True)
+        # Check printable ASCII ratio on raw decoded bytes (real base64 text is >= 85% printable)
+        printable_ratio = sum(1 for b in decoded_bytes if (32 <= b <= 126 or b in (9, 10, 13))) / max(len(decoded_bytes), 1)
+        if printable_ratio < 0.85:
+            return ""
         decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-        if len(decoded_str) >= 4 and any(c.isalnum() for c in decoded_str):
+        if len(decoded_str) >= 4:
             return decoded_str
     except Exception:
         pass
@@ -75,8 +79,11 @@ def try_decode_hex(candidate: str) -> str:
         return ""
     try:
         decoded_bytes = bytes.fromhex(cleaned)
+        printable_ratio = sum(1 for b in decoded_bytes if (32 <= b <= 126 or b in (9, 10, 13))) / max(len(decoded_bytes), 1)
+        if printable_ratio < 0.85:
+            return ""
         decoded_str = decoded_bytes.decode("utf-8", errors="ignore")
-        if len(decoded_str) >= 3 and any(c.isalnum() for c in decoded_str):
+        if len(decoded_str) >= 3:
             return decoded_str
     except Exception:
         pass

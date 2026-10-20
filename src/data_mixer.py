@@ -800,10 +800,16 @@ class MultimodalDataMixer:
         full_df = full_df.sample(frac=1.0, random_state=self.config.seed).reset_index(drop=True)
 
         total_n = len(full_df)
-        if total_n >= 4000:
+        if total_n > 4000:
             train_pool = full_df.iloc[:3500].copy().reset_index(drop=True)
             val_df = full_df.iloc[3500:4000].copy().reset_index(drop=True)
             test_df = full_df.iloc[4000:].copy().reset_index(drop=True)
+        elif total_n >= 3800:
+            # RMIT Hackathon official train.csv has 4,000 samples:
+            # 3,000 train (1,000 per Drop), 500 val, 500 internal benchmark test
+            train_pool = full_df.iloc[:3000].copy().reset_index(drop=True)
+            val_df = full_df.iloc[3000:3500].copy().reset_index(drop=True)
+            test_df = full_df.iloc[3500:4000].copy().reset_index(drop=True)
         else:
             n_train = min(3500, int(total_n * 0.70))
             n_val = min(500, int(total_n * 0.15))
