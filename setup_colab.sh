@@ -20,9 +20,10 @@ pip install --quiet \
     "accelerate>=0.34.0" \
     "peft>=0.13.0" \
     "trl>=0.11.0" \
-    "bitsandbytes>=0.43.0" \
+    "bitsandbytes>=0.46.1" \
     "qwen-vl-utils>=0.0.8" \
     "datasets>=2.18.0" \
+    "tabulate>=0.9.0" \
     "scikit-learn>=1.3.0" \
     "scipy>=1.11.0" \
     "pillow>=9.5.0" \

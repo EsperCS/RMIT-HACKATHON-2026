@@ -47,3 +47,4 @@ Toàn bộ các bảng trong `slides.tex` đã được thiết kế sẵn đún
 python main.py --full_run
 ```
 Bạn chỉ cần mở `slides.tex`, đối chiếu các con số trong `results/table*.csv` và cập nhật nếu cần.
+
