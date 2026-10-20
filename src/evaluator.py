@@ -10,8 +10,14 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import pandas as pd
 import numpy as np
+import matplotlib
+# Benchmark and Colab environments may not have a usable GUI/Tk backend.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:  # Styling must not prevent an otherwise valid benchmark run.
+    sns = None
 from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
@@ -146,7 +152,7 @@ class BenchmarkEvaluator:
             "Value": f"{auc_cleaned_train:.4f}"
         }, {
             "Metric": "ROC-AUC Delta (Gain from Sanitization)",
-            "Value": f"+{auc_cleaned_train - auc_noisy_train:.4f}"
+            "Value": f"{auc_cleaned_train - auc_noisy_train:+.4f}"
         }]
         df = pd.DataFrame(data)
         self.print_markdown_table("TABLE 0: SELF-FILTERING POISON SANITIZER REPORT", df)
@@ -185,7 +191,7 @@ class BenchmarkEvaluator:
         return df
 
     # -------------------------------------------------------------------------
-    # Table 3: End-to-End Protection for Target Model
+    # Table 3: Simulated end-to-end target-policy protection
     # -------------------------------------------------------------------------
     def report_table3_end_to_end_target(
         self,
@@ -200,7 +206,7 @@ class BenchmarkEvaluator:
                 "End-to-End Latency (ms)": f"{metrics['Latency_ms']:.1f} ms"
             })
         df = pd.DataFrame(rows)
-        self.print_markdown_table("TABLE 3: TARGET MODEL (QWEN/QWEN3.5-4B) END-TO-END DEFENSE", df)
+        self.print_markdown_table("TABLE 3: SIMULATED TARGET-POLICY END-TO-END DEFENSE", df)
         self.save_and_sync_table("table3_end_to_end_4b.csv", df)
         self.save_and_sync_table("table3_end_to_end_target.csv", df)
         return df
@@ -216,7 +222,10 @@ class BenchmarkEvaluator:
     ) -> Path:
         """Generates and saves publication-quality ROC Curve comparison plot."""
         plt.figure(figsize=(9, 7))
-        sns.set_theme(style="whitegrid")
+        if sns is not None:
+            sns.set_theme(style="whitegrid")
+        else:
+            plt.style.use("default")
 
         colors = ["#2b5c8f", "#d95f02", "#7570b3", "#e7298a", "#1b9e77"]
         

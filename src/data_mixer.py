@@ -316,7 +316,12 @@ def apply_disguised_benign_transformation(text: str, idx: int) -> Tuple[str, str
 # 7. Typographic Visual Jailbreak Image Generator
 # =============================================================================
 
-def generate_visual_jailbreak_images(df: pd.DataFrame, fraction: float = 0.15) -> pd.DataFrame:
+def generate_visual_jailbreak_images(
+    df: pd.DataFrame,
+    fraction: float = 0.15,
+    split_name: str = "dataset",
+    seed: Optional[int] = None,
+) -> pd.DataFrame:
     """
     Renders typographic visual jailbreaks ONLY for a fraction of adversarial samples.
     All other samples MUST strictly remain has_image = False, image_path = "".
@@ -334,13 +339,16 @@ def generate_visual_jailbreak_images(df: pd.DataFrame, fraction: float = 0.15) -
     jb_indices = out_df[out_df["true_label"] == 1].index.tolist()
     if len(jb_indices) > 0:
         n_visual = max(1, int(len(jb_indices) * fraction))
-        vis_indices = np.random.choice(jb_indices, size=min(n_visual, len(jb_indices)), replace=False)
+        rng = np.random.default_rng(seed)
+        vis_indices = rng.choice(jb_indices, size=min(n_visual, len(jb_indices)), replace=False)
     else:
         vis_indices = []
 
     for idx in vis_indices:
         original_text = out_df.at[idx, "prompt"]
-        img_file = SYNTHETIC_IMAGES_DIR / f"visual_jailbreak_{idx}.png"
+        # The split prefix prevents a global-test image from overwriting a
+        # training image after both DataFrames reset their row indices.
+        img_file = SYNTHETIC_IMAGES_DIR / f"{split_name}_visual_jailbreak_{idx}.png"
         generate_typographic_image(
             text=original_text,
             output_path=img_file,
@@ -645,7 +653,7 @@ def load_rmit_hackathon_2025_train_dataset() -> pd.DataFrame:
             categories.append("adversarial")
         else:
             p_low = p.lower()
-            if any(w in p_low for w in sensitive_words) or (i % 2 == 0):
+            if any(w in p_low for w in sensitive_words):
                 categories.append("hard_benign")
             else:
                 categories.append("normal_benign")
@@ -829,8 +837,12 @@ class MultimodalDataMixer:
         )
 
         # Multimodal Typographic Visual Jailbreaks (~15% of adversarial queries)
-        train_pool = generate_visual_jailbreak_images(train_pool, fraction=0.15)
-        test_df = generate_visual_jailbreak_images(test_df, fraction=0.15)
+        train_pool = generate_visual_jailbreak_images(
+            train_pool, fraction=0.15, split_name="train", seed=self.config.seed
+        )
+        test_df = generate_visual_jailbreak_images(
+            test_df, fraction=0.15, split_name="global_test", seed=self.config.seed + 1
+        )
 
         # Save Val and Global Test sets
         val_df.to_parquet(self.processed_dir / "val.parquet", index=False)
@@ -855,23 +867,28 @@ class MultimodalDataMixer:
             d["drop_id"] = f"drop_{i+1}"
             logger.info(f"[Data Mixer] Continual Red-Teaming Drop {i+1}: {len(d)} samples")
 
+        # Inject each drop once before cumulative training.  Re-injecting the
+        # entire cumulative round would let a record change poison status from
+        # one round to the next and invalidates the continual-learning protocol.
+        poison_rng = np.random.default_rng(self.config.seed)
+        for d in drop_dfs:
+            d["noisy_label"] = d["true_label"]
+            d["is_poisoned"] = False
+            jb_indices = d.index[d["true_label"] == 1].to_numpy()
+            if len(jb_indices):
+                n_poison = int(len(jb_indices) * self.config.poison_ratio)
+                if self.config.poison_ratio > 0 and n_poison == 0:
+                    n_poison = 1
+                poisoned = poison_rng.choice(jb_indices, size=n_poison, replace=False)
+                d.loc[poisoned, "noisy_label"] = 0
+                d.loc[poisoned, "is_poisoned"] = True
+
         # Protocol 1: Continual Accumulation (Round 1, 2, 3)
         cumulative = []
         for round_idx in range(1, len(drop_dfs) + 1):
             cumulative.append(drop_dfs[round_idx - 1])
             round_df = pd.concat(cumulative, ignore_index=True)
-            round_df["noisy_label"] = round_df["true_label"]
-            round_df["is_poisoned"] = False
-
-            # Inject 10% poison into jailbreak samples (flipping label 1 -> 0)
-            jb_indices = round_df[round_df["true_label"] == 1].index
-            if len(jb_indices) > 0:
-                n_poison = max(1, int(len(jb_indices) * self.config.poison_ratio))
-                poison_chosen = np.random.choice(jb_indices, size=n_poison, replace=False)
-                round_df.loc[poison_chosen, "noisy_label"] = 0
-                round_df.loc[poison_chosen, "is_poisoned"] = True
-            else:
-                n_poison = 0
+            n_poison = int(round_df["is_poisoned"].sum())
 
             round_df = round_df.sample(frac=1.0, random_state=self.config.seed).reset_index(drop=True)
             round_file = self.processed_dir / f"continual_round_{round_idx}.parquet"

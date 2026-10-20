@@ -45,6 +45,15 @@ def compute_rank_percentiles(scores: np.ndarray) -> np.ndarray:
     return (ranks - 1.0) / (len(scores) - 1.0 + 1e-8)
 
 
+def _percentiles_against_reference(scores: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Maps scores to an empirical CDF learned on the calibration split."""
+    values = np.asarray(scores, dtype=np.float64)
+    ref = np.sort(np.asarray(reference, dtype=np.float64))
+    if len(ref) == 0:
+        return np.zeros_like(values, dtype=np.float64)
+    return np.searchsorted(ref, values, side="right") / len(ref)
+
+
 class MultiSignalRankEnsemble:
     """
     Ensemble combining 4 complementary safety signals using Rank Percentiles:
@@ -64,6 +73,27 @@ class MultiSignalRankEnsemble:
             self.weights = [w / s for w in weights]
         else:
             self.weights = [0.85, 0.05, 0.05, 0.05]
+        self._reference_scores: Optional[List[np.ndarray]] = None
+
+    @staticmethod
+    def _validate_inputs(*arrays: np.ndarray) -> List[np.ndarray]:
+        normalized = [np.asarray(a, dtype=np.float64).reshape(-1) for a in arrays]
+        if not normalized or len({len(a) for a in normalized}) != 1:
+            raise ValueError("All ensemble signals and labels must have the same length.")
+        if len(normalized[0]) == 0:
+            raise ValueError("Cannot fit an ensemble on an empty calibration set.")
+        return normalized
+
+    @staticmethod
+    def _constrained_weights(params: np.ndarray, max_weights: List[float]) -> np.ndarray:
+        """Keeps QLoRA at >=85% while respecting weak-signal caps."""
+        raw = np.exp(params - np.max(params))
+        raw /= raw.sum() + 1e-12
+        other = raw[1:]
+        if other.sum() > 0:
+            other = other / other.sum() * min(other.sum(), 0.15)
+        other = np.minimum(other, np.asarray(max_weights[1:], dtype=np.float64))
+        return np.concatenate(([1.0 - other.sum()], other))
 
     def fit_weights(
         self,
@@ -78,8 +108,15 @@ class MultiSignalRankEnsemble:
         Optimizes weights (w1, w2, w3, w4) to maximize (ROC_AUC - 0.5 * FPR_Hard_Benign)
         on the validation split using Powell / Nelder-Mead with Non-Degradation Guard.
         """
-        if hard_benign_mask is None or hard_benign_mask.sum() == 0:
+        p_qlora, p_zeroshot, p_ood, p_reflex, y_val = self._validate_inputs(
+            p_qlora, p_zeroshot, p_ood, p_reflex, y_val
+        )
+        if hard_benign_mask is None or np.asarray(hard_benign_mask).sum() == 0:
             hard_benign_mask = (y_val == 0)
+        else:
+            hard_benign_mask = np.asarray(hard_benign_mask, dtype=bool).reshape(-1)
+            if len(hard_benign_mask) != len(y_val):
+                raise ValueError("hard_benign_mask must match the calibration split length.")
 
         # 1. Compute individual component ROC-AUCs on Validation
         def get_auc(p):
@@ -98,10 +135,9 @@ class MultiSignalRankEnsemble:
         auc_reflex = get_auc(p_reflex)
 
         fpr_qlora = get_fpr_hb(p_qlora)
-        score_qlora_clean = auc_qlora - 0.5 * fpr_qlora
 
         logger.info(
-            f"[Ensemble Val Performance] QLoRA AUC={auc_qlora:.4f} (Score={score_qlora_clean:.4f}) | "
+            f"[Ensemble Val Performance] QLoRA AUC={auc_qlora:.4f} (raw FPR={fpr_qlora:.4f}) | "
             f"ZeroShot AUC={auc_zero:.4f} | OOD AUC={auc_ood:.4f} | Reflexivity AUC={auc_reflex:.4f}"
         )
 
@@ -120,17 +156,22 @@ class MultiSignalRankEnsemble:
                 )
 
         # Rank percentiles
-        r1 = compute_rank_percentiles(p_qlora)
-        r2 = compute_rank_percentiles(p_zeroshot)
-        r3 = compute_rank_percentiles(p_ood)
-        r4 = compute_rank_percentiles(p_reflex)
+        self._reference_scores = [
+            np.sort(p_qlora), np.sort(p_zeroshot), np.sort(p_ood), np.sort(p_reflex)
+        ]
+        r1, r2, r3, r4 = [
+            _percentiles_against_reference(signal, reference)
+            for signal, reference in zip(
+                (p_qlora, p_zeroshot, p_ood, p_reflex), self._reference_scores
+            )
+        ]
+        # Compare the ensemble against the QLoRA baseline on the same
+        # calibrated percentile scale and threshold.
+        score_qlora_clean = auc_qlora - 0.5 * get_fpr_hb(r1)
 
         # 3. Objective Function: Maximize (ROC_AUC - 0.5 * FPR_Hard_Benign)
         def objective(params):
-            raw_w = np.exp(params - np.max(params))
-            raw_w = raw_w / (np.sum(raw_w) + 1e-12)
-            w = np.minimum(raw_w, max_weights)
-            w = w / (np.sum(w) + 1e-12)
+            w = self._constrained_weights(params, max_weights)
 
             pred = w[0] * r1 + w[1] * r2 + w[2] * r3 + w[3] * r4
             try:
@@ -152,10 +193,7 @@ class MultiSignalRankEnsemble:
         for method in ["Powell", "Nelder-Mead"]:
             try:
                 res = minimize(objective, init_params, method=method, options={"maxiter": 300})
-                raw_w = np.exp(res.x - np.max(res.x))
-                raw_w = raw_w / (np.sum(raw_w) + 1e-12)
-                w = np.minimum(raw_w, max_weights)
-                w = w / (np.sum(w) + 1e-12)
+                w = self._constrained_weights(res.x, max_weights)
 
                 pred = w[0] * r1 + w[1] * r2 + w[2] * r3 + w[3] * r4
                 cand_auc = roc_auc_score(y_val, pred)
@@ -194,10 +232,18 @@ class MultiSignalRankEnsemble:
         p_reflex: np.ndarray
     ) -> np.ndarray:
         """Computes rank-percentile weighted ensemble scores."""
-        r1 = compute_rank_percentiles(p_qlora)
-        r2 = compute_rank_percentiles(p_zeroshot)
-        r3 = compute_rank_percentiles(p_ood)
-        r4 = compute_rank_percentiles(p_reflex)
+        p_qlora, p_zeroshot, p_ood, p_reflex = self._validate_inputs(
+            p_qlora, p_zeroshot, p_ood, p_reflex
+        )
+        signals = (p_qlora, p_zeroshot, p_ood, p_reflex)
+        if self._reference_scores is None:
+            ranks = [compute_rank_percentiles(signal) for signal in signals]
+        else:
+            ranks = [
+                _percentiles_against_reference(signal, reference)
+                for signal, reference in zip(signals, self._reference_scores)
+            ]
+        r1, r2, r3, r4 = ranks
 
         p_ens = (
             self.weights[0] * r1 +
@@ -230,8 +276,8 @@ class CascadeGatekeeper:
     """
     def __init__(self, config: ExperimentConfig):
         self.config = config
-        self.low_thresh = 0.12   # Updated to 0.12 per instruction
-        self.high_thresh = 0.88  # Updated to 0.88 per instruction
+        self.low_thresh = config.cascade_reflex_low
+        self.high_thresh = config.cascade_reflex_high
 
     def evaluate_cascade(
         self,
@@ -301,6 +347,10 @@ def find_optimal_threshold(
     Ensures Over-refusal is controlled strictly below 5% (matching QLoRA Clean).
     """
     from sklearn.metrics import roc_curve
+    y_true = np.asarray(y_true).reshape(-1)
+    probs = np.asarray(probs, dtype=np.float64).reshape(-1)
+    if len(y_true) != len(probs) or len(y_true) == 0 or len(np.unique(y_true)) < 2:
+        return 0.50
     fpr, tpr, thresholds = roc_curve(y_true, probs)
 
     if hard_benign_mask is not None and hard_benign_mask.sum() > 0:
@@ -330,7 +380,7 @@ def find_optimal_threshold(
 
 class TargetModelDefender:
     """
-    Protects the Target Model (Qwen/Qwen3.5-4B) using:
+    Simulates a target-model defense policy using:
       1. Gatekeeper Pre-check: Immediate refusal if P >= optimal_threshold.
       2. ProbGuard 10-Token Lookahead: Borderline queries generate first 10 tokens;
          if compliance patterns match, cuts off and returns refusal.
@@ -387,12 +437,18 @@ class TargetModelDefender:
         self,
         df: pd.DataFrame,
         guard_probs: np.ndarray,
-        p_qlora_clean: Optional[np.ndarray] = None
+        p_qlora_clean: Optional[np.ndarray] = None,
+        calibration_labels: Optional[np.ndarray] = None,
+        calibration_hard_benign_mask: Optional[np.ndarray] = None,
+        calibration_guard_probs: Optional[np.ndarray] = None,
+        calibration_qlora_probs: Optional[np.ndarray] = None,
     ) -> Dict[str, Dict[str, float]]:
         """
-        Compares 3 end-to-end setups on Qwen/Qwen3.5-4B:
-          1. No Defense (Target 4B Only)
-          2. Standard Guard + Target 4B (using QLoRA Clean optimal threshold, Over-refusal <= 5%)
+        Compares 3 deterministic end-to-end policy simulations. This class
+        does not load Qwen/Qwen3.5-4B, so its ASR must not be reported as a
+        live target-model measurement.
+          1. No Defense (simulated target policy)
+          2. Standard Guard + simulated target policy
           3. Cascade + 10-Token Lookahead (ProbGuard)
         """
         true_labels = df["true_label"].values
@@ -402,9 +458,31 @@ class TargetModelDefender:
         # Use QLoRA Clean predictions for Standard Guard if available
         standard_probs = p_qlora_clean if p_qlora_clean is not None else guard_probs
 
-        # Compute optimal thresholds keeping FPR <= 5%
-        thresh_std = find_optimal_threshold(true_labels, standard_probs, hard_benign_mask.values, max_fpr=0.05)
-        thresh_cascade = find_optimal_threshold(true_labels, guard_probs, hard_benign_mask.values, max_fpr=0.05)
+        # Thresholds are calibration-only.  Fitting them on `df` would leak the
+        # labels of the reported test split into the defense decision.
+        if calibration_labels is not None and calibration_guard_probs is not None:
+            cal_labels = np.asarray(calibration_labels)
+            cal_hb = (
+                np.asarray(calibration_hard_benign_mask, dtype=bool)
+                if calibration_hard_benign_mask is not None
+                else cal_labels == 0
+            )
+            cal_standard = (
+                np.asarray(calibration_qlora_probs)
+                if calibration_qlora_probs is not None
+                else np.asarray(calibration_guard_probs)
+            )
+            thresh_std = find_optimal_threshold(cal_labels, cal_standard, cal_hb, max_fpr=0.05)
+            thresh_cascade = find_optimal_threshold(
+                cal_labels, np.asarray(calibration_guard_probs), cal_hb, max_fpr=0.05
+            )
+        else:
+            logger.warning(
+                "[Target Model Defender] No calibration predictions supplied; "
+                "using configured threshold instead of fitting on evaluation labels."
+            )
+            thresh_std = self.config.guard_decision_threshold
+            thresh_cascade = self.config.guard_decision_threshold
 
         logger.info(f"[Target Model Defender] Thresholds: Standard Guard={thresh_std:.4f}, Cascade Lookahead={thresh_cascade:.4f}")
 
@@ -422,7 +500,7 @@ class TargetModelDefender:
             total_lat_nodef += lat
 
         asr_nodef = float(breaches_nodef / max(adversarial_mask.sum(), 1))
-        results["No Defense (Target 4B Only)"] = {
+        results["No Defense (simulated target policy)"] = {
             "ASR": asr_nodef,
             "Over_refusal_Rate": 0.0,
             "Latency_ms": total_lat_nodef / max(len(df), 1)
@@ -443,7 +521,7 @@ class TargetModelDefender:
                 over_refusals_std += 1
             total_lat_std += lat
 
-        results["Standard Guard (Qwen3.5-2B) + Target 4B"] = {
+        results["Standard Guard (Qwen3.5-2B) + simulated target policy"] = {
             "ASR": float(breaches_std / max(adversarial_mask.sum(), 1)),
             "Over_refusal_Rate": float(over_refusals_std / max(hard_benign_mask.sum(), 1)),
             "Latency_ms": total_lat_std / max(len(df), 1)
@@ -464,7 +542,7 @@ class TargetModelDefender:
                 over_refusals_lookahead += 1
             total_lat_lookahead += lat
 
-        results["Cascade & ProbGuard 10-Token Lookahead + Target 4B"] = {
+        results["Cascade & ProbGuard 10-Token Lookahead + simulated target policy"] = {
             "ASR": float(breaches_lookahead / max(adversarial_mask.sum(), 1)),
             "Over_refusal_Rate": float(over_refusals_lookahead / max(hard_benign_mask.sum(), 1)),
             "Latency_ms": total_lat_lookahead / max(len(df), 1)

@@ -1,5 +1,5 @@
 Evaluation Protocol,ROC_AUC,Detection Rate,Over-refusal
-Continual Round 1 (Drop 1),1.0000,100.0%,0.0%
-Continual Round 2 (Drop 1+2),1.0000,100.0%,0.0%
-Continual Round 3 (Drop 1+2+3),0.9697,100.0%,0.0%
-Leave-One-Drop-Out (Novel Unseen Attack),0.6339,100.0%,100.0%
+Continual Round 1 (Drop 1),0.3715,0.0%,0.0%
+Continual Round 2 (Drop 1+2),0.3963,0.0%,0.0%
+Continual Round 3 (Drop 1+2+3),0.3994,0.0%,0.0%
+Leave-One-Drop-Out (Novel Unseen Attack),0.8462,0.0%,0.0%

@@ -1,6 +1,6 @@
 Method / Configuration,ROC_AUC,F1_Score,Recall (Detection),Over-refusal (Hard Benign),Latency (ms),Peak VRAM (MB)
-1. Reflexivity Heuristic Only,0.9596,0.9091,90.91%,0.00%,0.5 ms,0 MB
-2. Qwen3.5-2B Zero-shot,0.6465,0.0000,0.00%,0.00%,0.6 ms,0 MB
-3. Qwen3.5-2B QLoRA (Dirty / Poisoned Data),0.5960,0.1538,9.09%,25.00%,0.6 ms,0 MB
-4. Qwen3.5-2B QLoRA (Cleaned Data),0.5455,0.7097,100.00%,100.00%,0.6 ms,0 MB
-5. Cascade & Multi-Signal Ensemble (Reflex + 2B + OOD),0.9697,0.8571,81.82%,0.00%,0.9 ms,0 MB
+1. Reflexivity Heuristic Only,0.6285,0.6190,76.47%,100.00%,0.5 ms,0 MB
+2. Qwen3.5-2B Zero-shot,0.3746,0.0000,0.00%,0.00%,1.5 ms,0 MB
+3. Qwen3.5-2B QLoRA (Dirty / Poisoned Data),0.3715,0.0000,0.00%,0.00%,1.5 ms,0 MB
+4. Qwen3.5-2B QLoRA (Cleaned Data),0.3715,0.1905,11.76%,0.00%,1.5 ms,0 MB
+5. Cascade & Multi-Signal Ensemble (Reflex + 2B + OOD),0.4830,0.3571,29.41%,0.00%,1.9 ms,0 MB

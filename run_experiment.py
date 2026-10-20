@@ -116,6 +116,10 @@ def main():
         for r_path in PROCESSED_DATA_DIR.glob("continual_round_*.parquet"):
             datasets[r_path.stem] = pd.read_parquet(r_path)
 
+    if args.stage == "data":
+        logger.info("[Pipeline] Data preparation completed (--stage data).")
+        return
+
     if eval_split == "val":
         val_file = PROCESSED_DATA_DIR / "val.parquet"
         if not val_file.exists():
@@ -155,11 +159,18 @@ def main():
     p_vlm_dirty = None
     p_vlm_clean = None
     p_ood = None
+    p_continual_round2 = None
+    p_continual_round3 = None
     filter_metrics = None
     vlm_latency = 45.0
     vlm_vram = 0.0
 
-    if args.stage in ["all", "guard", "eval"]:
+    run_guard = (
+        args.stage in ["all", "guard", "eval", "e2e", "submission"]
+        or args.predict_test
+        or args.test_file is not None
+    )
+    if run_guard:
         logger.info("\n>>> [STAGE 3] Running Qwen Gatekeeper Branch (Zero-shot, Poison Filter, QLoRA, OOD)...")
         reset_peak_vram()
         vlm_branch = QwenVLMBranch(config)
@@ -183,6 +194,12 @@ def main():
         logger.info("[Gatekeeper 2B] Fine-tuning on Cleaned Data (Self-Filtered)...")
         vlm_branch.train_qlora(cleaned_round1_df, round_name="round_1_clean")
         p_vlm_clean, _ = vlm_branch.predict_logits_single_step(test_df)
+        emulated_round1_state = None
+        if vlm_branch.is_emulated:
+            emulated_round1_state = {
+                key: value.detach().cpu().clone()
+                for key, value in vlm_branch.emulated_net.state_dict().items()
+            }
         vlm_vram = get_peak_vram_mb()
         state.save_intermediate(f"{prefix}p_vlm_clean.npy", p_vlm_clean)
 
@@ -190,14 +207,59 @@ def main():
         logger.info("[Gatekeeper 2B] Computing OOD Anomaly Scores on Test Set...")
         p_ood = vlm_branch.compute_ood_scores(test_df)
         state.save_intermediate(f"{prefix}p_ood.npy", p_ood)
+        ood_reference_state = (
+            None if vlm_branch.benign_centroid is None else vlm_branch.benign_centroid.copy(),
+            None if vlm_branch.benign_cov_inv is None else vlm_branch.benign_cov_inv.copy(),
+            vlm_branch.ood_scale,
+        )
 
-        # 6. Novel Protocol (Leave-One-Drop-Out) Test Prediction
+        # 6. Continual protocol: train each cumulative round and evaluate each
+        # checkpoint on the same held-out benchmark.  Do not substitute slices
+        # of the test set for model checkpoints.
+        continual_predictions = {1: p_vlm_clean}
+        for continual_round in (2, 3):
+            continual_df = pd.read_parquet(
+                PROCESSED_DATA_DIR / f"continual_round_{continual_round}.parquet"
+            )
+            cleaned_continual_df, _ = vlm_branch.sanitize_poisoned_labels(continual_df)
+            vlm_branch.train_qlora(
+                cleaned_continual_df, round_name=f"round_{continual_round}_clean"
+            )
+            continual_predictions[continual_round], _ = vlm_branch.predict_logits_single_step(test_df)
+            state.save_intermediate(
+                f"{prefix}p_continual_round_{continual_round}.npy",
+                continual_predictions[continual_round],
+            )
+        p_continual_round2 = continual_predictions[2]
+        p_continual_round3 = continual_predictions[3]
+
+        # 7. Novel protocol: train only on Drops 1+2 and evaluate Drop 3.
         novel_test_file = PROCESSED_DATA_DIR / "novel_protocol_test.parquet"
-        if novel_test_file.exists():
-            logger.info("[Gatekeeper 2B] Evaluating Leave-One-Drop-Out Novel Attack Logits...")
+        novel_train_file = PROCESSED_DATA_DIR / "novel_protocol_train.parquet"
+        if novel_test_file.exists() and novel_train_file.exists():
+            logger.info("[Gatekeeper 2B] Training and evaluating Leave-One-Drop-Out Novel Attack protocol...")
             novel_test_df = pd.read_parquet(novel_test_file)
+            novel_train_df = pd.read_parquet(novel_train_file)
+            emulated_round3_state = None
+            if vlm_branch.is_emulated:
+                emulated_round3_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in vlm_branch.emulated_net.state_dict().items()
+                }
+            cleaned_novel_train, _ = vlm_branch.sanitize_poisoned_labels(novel_train_df)
+            vlm_branch.train_qlora(cleaned_novel_train, round_name="novel_drop12_clean")
             p_novel_clean, _ = vlm_branch.predict_logits_single_step(novel_test_df)
             state.save_intermediate(f"{prefix}p_novel_clean.npy", p_novel_clean)
+            if vlm_branch.is_emulated and emulated_round3_state is not None:
+                vlm_branch.emulated_net.load_state_dict(emulated_round3_state)
+        if vlm_branch.is_emulated and emulated_round1_state is not None:
+            vlm_branch.emulated_net.load_state_dict(emulated_round1_state)
+        elif hasattr(vlm_branch.model, "set_adapter"):
+            try:
+                vlm_branch.model.set_adapter("round_1_clean")
+            except Exception as exc:
+                logger.warning(f"[Gatekeeper 2B] Could not restore round_1_clean adapter: {exc}")
+        vlm_branch.benign_centroid, vlm_branch.benign_cov_inv, vlm_branch.ood_scale = ood_reference_state
 
         # Table 0 Generation: Poison Self-Filtering Sanitizer
         auc_dirty = float(roc_auc_score(y_test_true, p_vlm_dirty))
@@ -206,17 +268,42 @@ def main():
         state.mark_completed("guard_round_1")
         cleanup_vram()
 
+        if args.stage == "guard":
+            logger.info("[Pipeline] Guard training and cached predictions completed (--stage guard).")
+            return
+
     # Load cached probabilities if running evaluation standalone
     if p_vlm_zero is None:
-        p_vlm_zero = state.load_intermediate(f"{prefix}p_vlm_zero.npy")
+        p_vlm_zero = state.load_intermediate(f"{prefix}p_vlm_zero.npy", allow_missing=True)
     if p_vlm_dirty is None:
-        p_vlm_dirty = state.load_intermediate(f"{prefix}p_vlm_dirty.npy")
+        p_vlm_dirty = state.load_intermediate(f"{prefix}p_vlm_dirty.npy", allow_missing=True)
     if p_vlm_clean is None:
-        p_vlm_clean = state.load_intermediate(f"{prefix}p_vlm_clean.npy")
+        p_vlm_clean = state.load_intermediate(f"{prefix}p_vlm_clean.npy", allow_missing=True)
     if p_ood is None:
-        p_ood = state.load_intermediate(f"{prefix}p_ood.npy")
+        p_ood = state.load_intermediate(f"{prefix}p_ood.npy", allow_missing=True)
+    if p_continual_round2 is None:
+        p_continual_round2 = state.load_intermediate(
+            f"{prefix}p_continual_round_2.npy", allow_missing=True
+        )
+    if p_continual_round3 is None:
+        p_continual_round3 = state.load_intermediate(
+            f"{prefix}p_continual_round_3.npy", allow_missing=True
+        )
 
-    p_novel_clean = state.load_intermediate(f"{prefix}p_novel_clean.npy")
+    required_signals = {
+        "p_vlm_zero": p_vlm_zero,
+        "p_vlm_dirty": p_vlm_dirty,
+        "p_vlm_clean": p_vlm_clean,
+        "p_ood": p_ood,
+    }
+    missing_signals = [name for name, value in required_signals.items() if value is None]
+    if missing_signals:
+        raise RuntimeError(
+            "Required guard predictions are unavailable: "
+            f"{', '.join(missing_signals)}. Run --stage guard or --stage all first."
+        )
+
+    p_novel_clean = state.load_intermediate(f"{prefix}p_novel_clean.npy", allow_missing=True)
     novel_test_file = PROCESSED_DATA_DIR / "novel_protocol_test.parquet"
     novel_test_df = pd.read_parquet(novel_test_file) if novel_test_file.exists() else None
     if p_novel_clean is None and novel_test_df is not None:
@@ -227,15 +314,63 @@ def main():
     # -------------------------------------------------------------------------
     logger.info("\n>>> [STAGE 4] Computing Multi-Signal Ensemble & 2-Tier Cascade...")
 
-    # 1. Multi-Signal Rank-Averaging Ensemble (4 Signals)
+    # 1. Fit the ensemble strictly on validation data.  The global test labels
+    # are never used to tune weights or a decision threshold.
+    calibration_file = PROCESSED_DATA_DIR / "val.parquet"
+    if not calibration_file.exists():
+        raise FileNotFoundError("val.parquet is required to calibrate the ensemble.")
+    calibration_df = pd.read_parquet(calibration_file)
+    y_calibration = calibration_df["true_label"].values
+    hard_benign_calibration = (calibration_df["category"] == "hard_benign").values
+
+    if eval_split == "val":
+        logger.warning(
+            "[Evaluator] --val reports the calibration split; its ensemble metrics are diagnostics, "
+            "not an unbiased held-out benchmark."
+        )
+
+    p_reflexivity_calibration = reflex_clf.predict_proba(calibration_df["prompt"].tolist())
+    p_vlm_clean_calibration, _ = vlm_branch.predict_logits_single_step(calibration_df)
+    if not vlm_branch.is_emulated and hasattr(vlm_branch.model, "disable_adapter"):
+        try:
+            with vlm_branch.model.disable_adapter():
+                p_vlm_zero_calibration, _ = vlm_branch.predict_logits_single_step(calibration_df)
+        except Exception as exc:
+            logger.warning(f"[Ensemble] Could not evaluate adapter-free calibration signal: {exc}")
+            p_vlm_zero_calibration = p_vlm_clean_calibration
+    else:
+        p_vlm_zero_calibration = p_vlm_clean_calibration
+    p_ood_calibration = vlm_branch.compute_ood_scores(calibration_df)
+
+    # 2. Multi-Signal rank ensemble, calibrated on validation only.
     ensemble = MultiSignalRankEnsemble()
-    ensemble.fit_weights(p_vlm_clean, p_vlm_zero, p_ood, p_reflexivity, y_test_true)
+    ensemble.fit_weights(
+        p_vlm_clean_calibration,
+        p_vlm_zero_calibration,
+        p_ood_calibration,
+        p_reflexivity_calibration,
+        y_calibration,
+        hard_benign_calibration,
+    )
+    p_ensemble_calibration = ensemble.predict(
+        p_vlm_clean_calibration,
+        p_vlm_zero_calibration,
+        p_ood_calibration,
+        p_reflexivity_calibration,
+    )
     p_ensemble = ensemble.predict(p_vlm_clean, p_vlm_zero, p_ood, p_reflexivity)
 
-    # 2. 2-Tier Cascade Gatekeeper (Fast Screen -> Deep Guard)
+    # 3. 2-Tier Cascade Gatekeeper (Fast Screen -> Deep Guard)
     cascade = CascadeGatekeeper(config)
     p_cascade, _, cascade_lat, tier2_route_pct = cascade.evaluate_cascade(
         test_df, p_reflexivity, p_ensemble, reflex_latency, vlm_latency
+    )
+    p_cascade_calibration, _, _, _ = cascade.evaluate_cascade(
+        calibration_df,
+        p_reflexivity_calibration,
+        p_ensemble_calibration,
+        reflex_latency,
+        vlm_latency,
     )
 
     # -------------------------------------------------------------------------
@@ -306,24 +441,36 @@ def main():
 
     # TABLE 2: Continual Rounds Evolution & Novel Attack (Leave-One-Drop-Out)
     # Dynamically compute metrics from real model predictions without hardcoded multipliers
-    best_guard_probs = p_vlm_clean if m_vlm_clean["ROC_AUC"] >= m_cascade_ens["ROC_AUC"] else p_cascade
-    opt_thresh_best = find_optimal_threshold(y_test_true, best_guard_probs, hard_benign_mask, max_fpr=0.05)
+    calibration_clean_auc = compute_metrics(
+        y_calibration, p_vlm_clean_calibration, hard_benign_calibration
+    )["ROC_AUC"]
+    calibration_cascade_auc = compute_metrics(
+        y_calibration, p_cascade_calibration, hard_benign_calibration
+    )["ROC_AUC"]
+    if calibration_clean_auc >= calibration_cascade_auc:
+        best_guard_probs = p_vlm_clean
+        best_guard_probs_calibration = p_vlm_clean_calibration
+    else:
+        best_guard_probs = p_cascade
+        best_guard_probs_calibration = p_cascade_calibration
+    opt_thresh_best = find_optimal_threshold(
+        y_calibration, best_guard_probs_calibration, hard_benign_calibration, max_fpr=0.05
+    )
 
-    n_total = len(test_df)
-    n_r1 = max(1, n_total // 3)
-    n_r2 = max(n_r1 + 1, 2 * n_total // 3)
-
-    # Continual Round 1 (Drop 1 partition)
+    # Each row uses predictions from the model trained at that actual
+    # cumulative checkpoint, evaluated on one fixed held-out benchmark.
+    if p_continual_round2 is None or p_continual_round3 is None:
+        raise RuntimeError(
+            "Continual-round predictions are unavailable. Run --stage guard or --stage all first."
+        )
     m_round1 = compute_metrics(
-        y_test_true[:n_r1], best_guard_probs[:n_r1], hard_benign_mask[:n_r1], threshold=opt_thresh_best
+        y_test_true, p_vlm_clean, hard_benign_mask, threshold=opt_thresh_best
     )
-    # Continual Round 2 (Drop 1+2 cumulative partition)
     m_round2 = compute_metrics(
-        y_test_true[:n_r2], best_guard_probs[:n_r2], hard_benign_mask[:n_r2], threshold=opt_thresh_best
+        y_test_true, p_continual_round2, hard_benign_mask, threshold=opt_thresh_best
     )
-    # Continual Round 3 (Drop 1+2+3 full benchmark)
     m_round3 = compute_metrics(
-        y_test_true, best_guard_probs, hard_benign_mask, threshold=opt_thresh_best
+        y_test_true, p_continual_round3, hard_benign_mask, threshold=opt_thresh_best
     )
 
     continual_data = [
@@ -353,9 +500,8 @@ def main():
         hb_novel_mask = (novel_test_df["category"] == "hard_benign").values
         m_novel = compute_metrics(y_novel_true, p_novel_clean, hb_novel_mask, threshold=opt_thresh_best)
     else:
-        heldout_slice = slice(n_r2, n_total)
-        m_novel = compute_metrics(
-            y_test_true[heldout_slice], best_guard_probs[heldout_slice], hard_benign_mask[heldout_slice], threshold=opt_thresh_best
+        raise RuntimeError(
+            "Novel-protocol predictions are unavailable. Run --stage guard or --stage all first."
         )
 
     novel_data = {
@@ -373,7 +519,15 @@ def main():
 
     # TABLE 3: Target Model (Qwen/Qwen3.5-4B) End-to-End Defense
     defender = TargetModelDefender(config)
-    e2e_results = defender.evaluate_e2e_benchmark(test_df, p_cascade, p_vlm_clean)
+    e2e_results = defender.evaluate_e2e_benchmark(
+        test_df,
+        p_cascade,
+        p_vlm_clean,
+        calibration_labels=y_calibration,
+        calibration_hard_benign_mask=hard_benign_calibration,
+        calibration_guard_probs=p_cascade_calibration,
+        calibration_qlora_probs=p_vlm_clean_calibration,
+    )
     evaluator.report_table3_end_to_end_target(e2e_results)
     if eval_split == "val":
         evaluator.save_and_sync_table("table3_val_end_to_end_4b.csv", pd.DataFrame(e2e_results))
@@ -486,9 +640,10 @@ def generate_competition_submission(
     # 5. Multi-Signal Ensemble & Cascade
     logger.info("[Submission] 5/5 Applying Optimized Ensemble & Cascade Gatekeeper...")
     p_ensemble = ensemble.predict(p_qlora, p_zero, p_ood, p_reflex)
-    p_cascade, stages, t1_pct, avg_lat = cascade.evaluate_cascade(
+    p_cascade, stages, avg_lat, tier2_rate = cascade.evaluate_cascade(
         test_df, p_reflex, p_ensemble, reflex_latency_ms=0.5, deep_latency_ms=vlm_latency
     )
+    tier1_rate = 1.0 - tier2_rate
 
     # 6. Build Submission DataFrame matching sample_submission.csv
     target_col = "TARGET"
@@ -510,8 +665,13 @@ def generate_competition_submission(
         })
 
     # Validate output
-    assert len(submission_df) == len(test_df), f"Row count mismatch: {len(submission_df)} vs {len(test_df)}"
+    expected_rows = len(sample_sub) if sample_sub is not None else len(test_df)
+    assert len(submission_df) == expected_rows, f"Row count mismatch: {len(submission_df)} vs {expected_rows}"
     assert not submission_df.isna().any().any(), "Submission DataFrame contains NaN values!"
+    if sample_sub is not None:
+        unmatched_ids = submission_df[target_col].eq(0.5) & ~sample_sub[id_col].isin(test_df["Id"])
+        if unmatched_ids.any():
+            raise ValueError("sample_submission.csv contains Id values absent from test.csv.")
 
     # 7. Save Submission Files
     sub_primary = RESULTS_DIR / "submission.csv"
@@ -544,8 +704,8 @@ def generate_competition_submission(
         f"Median={submission_df[target_col].median():.4f} | "
         f"Max={submission_df[target_col].max():.4f}"
     )
-    logger.info(f" Tier 1 Fast Screened    : {t1_pct:.1%}")
-    logger.info(f" Tier 2 Deep VLM         : {100.0 - t1_pct:.1%}")
+    logger.info(f" Tier 1 Fast Screened    : {tier1_rate:.1%}")
+    logger.info(f" Tier 2 Deep VLM         : {tier2_rate:.1%}")
     logger.info(f" Avg Test Latency        : {avg_lat:.2f} ms/query")
     logger.info("-" * 80)
     logger.info(" Preview First 10 Rows (submission.csv):")

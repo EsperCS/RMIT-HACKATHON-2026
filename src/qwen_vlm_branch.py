@@ -59,6 +59,8 @@ class QwenVLMBranch:
         self.checkpoints_dir = CHECKPOINTS_DIR
         self.is_emulated = False
         self.benign_centroid: Optional[np.ndarray] = None
+        self.benign_cov_inv: Optional[np.ndarray] = None
+        self.ood_scale: float = 1.0
         self.model_id = getattr(config, "guard_model_id", getattr(config, "preferred_guard_vlm_id", "Qwen/Qwen3.5-2B"))
         
         # Load VLM with architecture verification and automatic fallback
@@ -133,22 +135,24 @@ class QwenVLMBranch:
             mdl.eval()
 
             tok = proc.tokenizer
-            # Extract distinct single-token representations for Safe and Unsafe
-            safe_ids = []
-            for w in ["Safe", " safe", "SAFE", "safe"]:
-                sub = tok.encode(w, add_special_tokens=False)
-                if sub:
-                    safe_ids.append(sub[0])
-            unsafe_ids = []
-            for w in ["Unsafe", " unsafe", "UN", "unsafe"]:
-                sub = tok.encode(w, add_special_tokens=False)
-                if sub:
-                    unsafe_ids.append(sub[0])
 
-            safe_ids = sorted(list(set(safe_ids)))
-            unsafe_ids = sorted(list(set([x for x in unsafe_ids if x not in safe_ids])))
-            s_id = safe_ids[0] if safe_ids else tok.encode("Safe", add_special_tokens=False)[0]
-            u_id = unsafe_ids[0] if unsafe_ids else tok.encode("Unsafe", add_special_tokens=False)[0]
+            # Training and one-step scoring operate on one vocabulary logit.
+            # Never use the first token of a multi-token word (for example
+            # "UN" for "Unsafe"), because it is not a class label.
+            def _single_token_id(label: str) -> int:
+                for candidate in (f" {label}", label):
+                    ids = tok.encode(candidate, add_special_tokens=False)
+                    if len(ids) == 1:
+                        return ids[0]
+                raise ValueError(
+                    f"{label!r} is not represented by one token; "
+                    "sequence-level label scoring is required for this tokenizer."
+                )
+
+            s_id = _single_token_id("Safe")
+            u_id = _single_token_id("Unsafe")
+            safe_ids = [s_id]
+            unsafe_ids = [u_id]
 
             # SANITY CHECK: Run a test inference forward pass to verify layer shapes match
             test_msg = [{"role": "user", "content": [{"type": "text", "text": "Evaluate safety: Hello"}]}]
@@ -183,6 +187,7 @@ class QwenVLMBranch:
     def _init_cpu_engine(self):
         """Initializes a lightweight multimodal neural classifier for CPU / quick_test."""
         self.is_emulated = True
+        self.model = None
         self.safe_token_id = 0
         self.unsafe_token_id = 1
         self.safe_token_ids = [0]
@@ -287,7 +292,7 @@ class QwenVLMBranch:
                         last_logits = outputs.logits[0, -1, :]
                         z_unsafe = torch.logsumexp(last_logits[u_idx], dim=0).item()
                         z_safe = torch.logsumexp(last_logits[s_idx], dim=0).item()
-                        prob = float(1.0 / (1.0 + np.exp(-(z_unsafe - z_safe))))
+                        prob = float(torch.sigmoid(torch.tensor(z_unsafe - z_safe)).item())
                     except Exception as err:
                         logger.warning(f"[VLM Single-Step Warning] Query {idx} error ({err}), falling back to 0.5")
                         prob = 0.5
@@ -318,6 +323,16 @@ class QwenVLMBranch:
         benign_mask = cleaned_df["noisy_label"] == 0
         benign_indices = cleaned_df[benign_mask].index
         
+        if len(benign_indices) == 0:
+            cleaned_df["sanitized_label"] = cleaned_df["noisy_label"]
+            return cleaned_df, {
+                "poison_precision": 1.0,
+                "poison_recall": 0.0,
+                "poison_f1": 0.0,
+                "total_poison_injected": int(cleaned_df.get("is_poisoned", pd.Series(False, index=cleaned_df.index)).sum()),
+                "total_poison_caught": 0,
+            }
+
         probs, _ = self.predict_logits_single_step(cleaned_df.loc[benign_indices])
         
         # Adaptive Statistical Threshold (mu + 1.1 * sigma):
@@ -326,7 +341,7 @@ class QwenVLMBranch:
         mu = float(np.mean(probs))
         sigma = float(np.std(probs))
         adaptive_thresh = float(mu + 1.1 * sigma)
-        threshold = float(np.clip(adaptive_thresh, 0.25, 0.48))
+        threshold = float(np.clip(adaptive_thresh, 0.0, 1.0))
         
         logger.info(
             f"[VLM Self-Filtering] Statistical outlier threshold: {threshold:.4f} "
@@ -382,6 +397,18 @@ class QwenVLMBranch:
             b_img_stats = np.vstack([self._extract_image_stats(safe_load_image(p)) for p in benign_sub["image_path"]])
             b_all = np.hstack([b_reflex, b_has_img, b_img_stats])
             self.benign_centroid = b_all.mean(axis=0)
+            centered = b_all - self.benign_centroid
+            if len(b_all) > 1:
+                covariance = (centered.T @ centered) / max(len(b_all) - 1, 1)
+                covariance += np.eye(covariance.shape[0], dtype=np.float32) * 1e-4
+                self.benign_cov_inv = np.linalg.pinv(covariance)
+                benign_distances = np.sqrt(
+                    np.einsum("ij,jk,ik->i", centered, self.benign_cov_inv, centered)
+                )
+                self.ood_scale = float(max(np.quantile(benign_distances, 0.95), 1e-6))
+            else:
+                self.benign_cov_inv = np.eye(b_all.shape[1], dtype=np.float32)
+                self.ood_scale = 1.0
 
         if self.is_emulated:
             optimizer = torch.optim.Adam(self.emulated_net.parameters(), lr=1e-3)
@@ -422,7 +449,7 @@ class QwenVLMBranch:
                     lora_dropout=self.config.lora_params.lora_dropout,
                     bias="none",
                     task_type="CAUSAL_LM",
-                    target_modules=["q_proj", "v_proj"]
+                    target_modules=self.config.lora_params.target_modules
                 )
 
                 if not hasattr(self.model, "peft_config"):
@@ -465,11 +492,12 @@ class QwenVLMBranch:
                 epochs = self.config.vlm_epochs if not self.config.quick_test else 1
                 batch_size = max(1, self.config.vlm_batch_size)
 
+                grad_accum = max(1, self.config.vlm_gradient_accumulation_steps)
                 for ep in range(epochs):
                     shuffled_indices = np.random.permutation(len(cleaned_train_df))
+                    optimizer.zero_grad(set_to_none=True)
                     for b_start in range(0, len(shuffled_indices), batch_size):
                         b_idx = shuffled_indices[b_start:b_start + batch_size]
-                        optimizer.zero_grad()
                         b_denom = max(len(b_idx), 1)
 
                         for idx in b_idx:
@@ -517,10 +545,14 @@ class QwenVLMBranch:
                             outputs = self.model(**inputs)
                             last_logits = outputs.logits[0, -1, :].unsqueeze(0)
                             target_tensor = torch.tensor([target_token_id], device=model_device)
-                            loss = criterion(last_logits, target_tensor) / b_denom
+                            loss = criterion(last_logits, target_tensor) / (b_denom * grad_accum)
                             loss.backward()
 
-                        optimizer.step()
+                        batch_number = (b_start // batch_size) + 1
+                        is_last_batch = b_start + batch_size >= len(shuffled_indices)
+                        if batch_number % grad_accum == 0 or is_last_batch:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
 
                 self.model.eval()
                 lora_save_dir = self.checkpoints_dir / f"vlm_lora_{round_name}"
@@ -540,7 +572,7 @@ class QwenVLMBranch:
         """
         Computes Cosine/Mahalanobis distance from benign centroid to detect novel attacks.
         """
-        if self.benign_centroid is None:
+        if self.benign_centroid is None or self.benign_cov_inv is None:
             return np.zeros(len(df), dtype=np.float32)
             
         reflex_feats = extract_reflexivity_features_batch(df["prompt"].tolist())
@@ -554,11 +586,14 @@ class QwenVLMBranch:
         
         all_feats = np.hstack([reflex_feats, has_imgs, img_stats])
         
-        # Euclidean / Cosine distance to benign centroid
+        # Feature-space Mahalanobis distance.  The scale is fitted from benign
+        # training examples, never from the current evaluation/submission batch.
         diff = all_feats - self.benign_centroid
-        distances = np.linalg.norm(diff, axis=1)
-        norm_distances = distances / (np.max(distances) + 1e-6)
-        return norm_distances.astype(np.float32)
+        distances = np.sqrt(np.maximum(
+            np.einsum("ij,jk,ik->i", diff, self.benign_cov_inv, diff), 0.0
+        ))
+        scores = 1.0 - np.exp(-distances / max(self.ood_scale, 1e-6))
+        return np.clip(scores, 0.0, 1.0).astype(np.float32)
 
 
 if __name__ == "__main__":

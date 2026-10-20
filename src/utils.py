@@ -252,7 +252,7 @@ class ExperimentState:
         sync_to_drive(target_path, self.drive_backup_dir)
         return target_path
 
-    def load_intermediate(self, filename: str) -> Any:
+    def load_intermediate(self, filename: str, allow_missing: bool = False) -> Any:
         target_path = self.checkpoints_dir / filename
         if not target_path.exists() and self.drive_backup_dir:
             drive_path = self.drive_backup_dir / filename
@@ -260,6 +260,8 @@ class ExperimentState:
                 shutil.copy2(drive_path, target_path)
 
         if not target_path.exists():
+            if allow_missing:
+                return None
             raise FileNotFoundError(f"Intermediate file not found: {filename}")
 
         if filename.endswith(".npy"):

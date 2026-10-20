@@ -96,7 +96,7 @@ def build_table2_latex(df: pd.DataFrame) -> str:
 
 
 def build_table3_latex(df: pd.DataFrame) -> str:
-    """Builds LaTeX tabular rows for Table 3 (Target 4B Protection)."""
+    """Builds LaTeX tabular rows for Table 3 (simulated target-policy results)."""
     rows = []
     for _, row in df.iterrows():
         cfg = str(row.iloc[0]).strip()
@@ -107,12 +107,12 @@ def build_table3_latex(df: pd.DataFrame) -> str:
         if "Cascade" in cfg or "ProbGuard" in cfg:
             rows.append(
                 f"            \\rowcolor{{LightCyan}}\n"
-                f"            \\textbf{{Cascade \\& ProbGuard 10-Token Lookahead + Target 4B}} & \\textbf{{{asr}}} \\textcolor{{SuccessGreen}}{{(Fully Blocked)}} & \\textbf{{{fpr}}} & \\textbf{{{lat}}} \\\\"
+                f"            \\textbf{{Cascade \\& ProbGuard + simulated target policy}} & \\textbf{{{asr}}} & \\textbf{{{fpr}}} & \\textbf{{{lat}}} \\\\"
             )
         elif "No Defense" in cfg:
-            rows.append(f"            No Defense (Target 4B Only) & {asr} \\textcolor{{RMITRed}}{{(Vulnerable)}} & {fpr} & {lat} \\\\")
+            rows.append(f"            No Defense (simulated target policy) & {asr} & {fpr} & {lat} \\\\")
         elif "Standard Guard" in cfg:
-            rows.append(f"            Standard Guard (Qwen3.5-2B) + Target 4B & {asr} & {fpr} & {lat} \\\\")
+            rows.append(f"            Standard Guard (Qwen3.5-2B) + simulated target policy & {asr} & {fpr} & {lat} \\\\")
         else:
             rows.append(f"            {format_latex_escape(cfg)} & {asr} & {fpr} & {lat} \\\\")
 
