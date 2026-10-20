@@ -415,6 +415,7 @@ class QwenVLMBranch:
         else:
             try:
                 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+                adapter_name = round_name.replace("-", "_")
                 lora_cfg = LoraConfig(
                     r=self.config.lora_params.r,
                     lora_alpha=self.config.lora_params.lora_alpha,
@@ -423,12 +424,35 @@ class QwenVLMBranch:
                     task_type="CAUSAL_LM",
                     target_modules=["q_proj", "v_proj"]
                 )
+
                 if not hasattr(self.model, "peft_config"):
                     try:
                         self.model = prepare_model_for_kbit_training(self.model, use_gradient_checkpointing=False)
                     except Exception:
                         pass
-                    self.model = get_peft_model(self.model, lora_cfg)
+                    if hasattr(self.model, "enable_input_require_grads"):
+                        try:
+                            self.model.enable_input_require_grads()
+                        except Exception:
+                            pass
+                    try:
+                        self.model = get_peft_model(self.model, lora_cfg, adapter_name=adapter_name)
+                    except Exception:
+                        lora_cfg.task_type = None
+                        self.model = get_peft_model(self.model, lora_cfg, adapter_name=adapter_name)
+                else:
+                    # Model already has PEFT adapter attached. Add separate adapter for this round if needed
+                    existing_adapters = getattr(self.model, "peft_config", {})
+                    if adapter_name not in existing_adapters:
+                        try:
+                            self.model.add_adapter(adapter_name, lora_cfg)
+                        except Exception:
+                            lora_cfg.task_type = None
+                            self.model.add_adapter(adapter_name, lora_cfg)
+                    try:
+                        self.model.set_adapter(adapter_name)
+                    except Exception:
+                        pass
 
                 self.model.train()
                 optimizer = torch.optim.AdamW(
@@ -446,7 +470,7 @@ class QwenVLMBranch:
                     for b_start in range(0, len(shuffled_indices), batch_size):
                         b_idx = shuffled_indices[b_start:b_start + batch_size]
                         optimizer.zero_grad()
-                        total_loss = torch.tensor(0.0, device=model_device, requires_grad=True)
+                        b_denom = max(len(b_idx), 1)
 
                         for idx in b_idx:
                             row = cleaned_train_df.iloc[idx]
@@ -493,13 +517,12 @@ class QwenVLMBranch:
                             outputs = self.model(**inputs)
                             last_logits = outputs.logits[0, -1, :].unsqueeze(0)
                             target_tensor = torch.tensor([target_token_id], device=model_device)
-                            loss = criterion(last_logits, target_tensor)
-                            total_loss = total_loss + loss
+                            loss = criterion(last_logits, target_tensor) / b_denom
+                            loss.backward()
 
-                        total_loss = total_loss / max(len(b_idx), 1)
-                        total_loss.backward()
                         optimizer.step()
 
+                self.model.eval()
                 lora_save_dir = self.checkpoints_dir / f"vlm_lora_{round_name}"
                 lora_save_dir.mkdir(parents=True, exist_ok=True)
                 self.model.save_pretrained(str(lora_save_dir))
